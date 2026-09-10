@@ -35,6 +35,17 @@
     </p>
   </div>
 
+{% elif job.status == 'transcribing' %}
+  <div class="panel">
+    <b>Transcribing</b>
+    <p class="muted" style="margin:6px 0 0">
+      Turning the audio into text with timestamps, so you can read the video
+      instead of scrubbing it. Expect roughly the length of the video.
+      {% if suggestions_enabled %}Clip suggestions follow.{% endif %}
+      You can close this page; it keeps going.
+    </p>
+  </div>
+
 {# ------------------------------------------------------- awaiting cuts #}
 {% elif job.status == 'awaiting_cuts' or preview %}
 
@@ -88,17 +99,106 @@
     </form>
 
   {% else %}
-    <h2>Paste your cut points</h2>
-    <div class="panel">
-      <form method="post" action="/jobs/{{ job.id }}/cuts">
-        <label for="cuts">One clip per line</label>
-        <textarea id="cuts" name="cuts" rows="10" required autofocus
-          placeholder="00:04:17 - 00:05:22&#10;00:12:03 - 00:13:40 | Founder origin story">{{ cuts_text or '' }}</textarea>
-        <button class="btn" style="margin-top:14px">Check the list</button>
-        <span class="muted" style="margin-left:10px;font-size:13px">
-          You will see exactly what was understood before anything renders.
-        </span>
-      </form>
+
+    {% if job.transcript_error %}
+      <div class="note warn">
+        <b>No transcript.</b> {{ job.transcript_error }}
+        You can still paste timestamps by hand below.
+      </div>
+    {% endif %}
+
+    {% if suggestions %}
+      <div class="spread" style="margin-top:24px">
+        <h2 style="margin:0">Suggested clips</h2>
+        <form method="post" action="/jobs/{{ job.id }}/suggest" style="margin:0">
+          <button class="btn secondary" style="padding:6px 12px;font-size:13px">Suggest again</button>
+        </form>
+      </div>
+      <p class="sub" style="margin:6px 0 12px">
+        Proposals only. Tick the ones you want, then edit freely before rendering.
+        Timestamps come from the transcript, not from the model.
+      </p>
+      <div class="panel" style="padding:8px 0">
+        {% for s in suggestions %}
+          <label class="suggestion">
+            <input type="checkbox" class="sugg" checked
+                   data-start="{{ '%.3f'|format(s.start) }}"
+                   data-end="{{ '%.3f'|format(s.end) }}"
+                   data-title="{{ s.title }}">
+            <span>
+              <b>{{ s.title }}</b>
+              <span class="mono muted" style="font-size:12px;margin-left:8px">
+                {{ s.start | timestamp }} &rarr; {{ s.end | timestamp }}
+                ({{ '%.0f'|format(s.end - s.start) }}s)
+              </span>
+              <div class="muted" style="font-size:13px;margin-top:2px">{{ s.reason }}</div>
+            </span>
+          </label>
+        {% endfor %}
+        <div style="padding:12px 18px 6px">
+          <button type="button" class="btn" id="useSuggestions">Use ticked suggestions</button>
+        </div>
+      </div>
+    {% elif job.suggestion_error %}
+      <div class="note">
+        <b>No clip suggestions.</b> {{ job.suggestion_error }}
+      </div>
+    {% endif %}
+
+    <h2>Cut points</h2>
+    <div class="split">
+      <div>
+        <div class="panel" style="margin-bottom:12px">
+          <form method="post" action="/jobs/{{ job.id }}/cuts">
+            <label for="cuts">One clip per line</label>
+            <textarea id="cuts" name="cuts" rows="12" required
+              placeholder="00:04:17 - 00:05:22&#10;00:12:03 - 00:13:40 | Founder origin story">{{ cuts_text or '' }}</textarea>
+            <div class="row" style="margin-top:12px">
+              <button class="btn">Check the list</button>
+              <button type="button" class="btn secondary" id="markIn">Set start from player</button>
+              <button type="button" class="btn secondary" id="markOut">Set end from player</button>
+            </div>
+          </form>
+        </div>
+        <div class="note" style="font-size:13px">
+          <b>Formats.</b> <span class="mono">-</span>,
+          <span class="mono">-&gt;</span>, <span class="mono">to</span> or a comma
+          between start and end. <span class="mono">HH:MM:SS</span>,
+          <span class="mono">MM:SS</span>, <span class="mono">HH:MM:SS.mmm</span>
+          or plain seconds. <span class="mono">| label</span> names a clip.
+          <span class="mono">#</span> comments a line out.
+          {% if job.duration_seconds %}
+            Video runs to <span class="mono">{{ job.duration_seconds | timestamp }}</span>.
+          {% endif %}
+        </div>
+      </div>
+
+      <div>
+        {% if source_available %}
+          <video id="player" controls preload="metadata"
+                 src="/jobs/{{ job.id }}/source"></video>
+        {% endif %}
+
+        {% if transcript %}
+          <div class="panel" style="padding:12px">
+            <input type="text" id="findText" placeholder="Search the transcript"
+                   style="margin-bottom:10px">
+            <div id="transcript" class="transcript">
+              {% for line in transcript %}
+                <p class="tline" data-start="{{ '%.3f'|format(line.start_seconds) }}"
+                   data-end="{{ '%.3f'|format(line.end_seconds) }}">
+                  <span class="tstamp mono">{{ line.start_seconds | timestamp }}</span>
+                  <span class="ttext">{{ line.text }}</span>
+                </p>
+              {% endfor %}
+            </div>
+            <p class="muted" style="font-size:12px;margin:10px 0 0">
+              Click a line to jump the player there. Shift-click to set it as a
+              clip start, then click another line to close the range.
+            </p>
+          </div>
+        {% endif %}
+      </div>
     </div>
 
     <div class="note">
@@ -189,7 +289,94 @@
   </form>
 {% endif %}
 
-{% if job.status in ('uploading','uploaded','probing','queued','rendering') %}
+{% if transcript or suggestions %}
+<script>
+// Transcript workspace. Everything here only ever writes text into the cut box;
+// the box is still parsed, validated and confirmed exactly as if typed by hand.
+const box    = document.getElementById('cuts');
+const player = document.getElementById('player');
+const lines  = [...document.querySelectorAll('.tline')];
+
+const fmt = s => {
+  const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60);
+  const sec = (s % 60).toFixed(3).padStart(6, '0');
+  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${sec}`;
+};
+const appendLine = text => {
+  box.value = (box.value && !box.value.endsWith('\n') ? box.value + '\n' : box.value) + text + '\n';
+  box.scrollTop = box.scrollHeight;
+};
+
+// Click a line to seek. Shift-click opens a range; the next click closes it.
+let rangeStart = null;
+lines.forEach(line => {
+  line.onclick = event => {
+    const start = parseFloat(line.dataset.start);
+    if (event.shiftKey) {
+      lines.forEach(l => l.classList.remove('range-start'));
+      rangeStart = start;
+      line.classList.add('range-start');
+      return;
+    }
+    if (rangeStart !== null) {
+      const end = parseFloat(line.dataset.end);
+      if (end > rangeStart) appendLine(`${fmt(rangeStart)} - ${fmt(end)}`);
+      rangeStart = null;
+      lines.forEach(l => l.classList.remove('range-start'));
+      return;
+    }
+    if (player) { player.currentTime = start; player.play(); }
+  };
+});
+
+// Follow along while the video plays.
+if (player) {
+  player.ontimeupdate = () => {
+    const t = player.currentTime;
+    for (const line of lines) {
+      const on = t >= parseFloat(line.dataset.start) && t < parseFloat(line.dataset.end);
+      line.classList.toggle('playing', on);
+    }
+  };
+  const markIn  = document.getElementById('markIn');
+  const markOut = document.getElementById('markOut');
+  if (markIn)  markIn.onclick  = () => appendLine(`${fmt(player.currentTime)} - `);
+  if (markOut) markOut.onclick = () => {
+    box.value = box.value.replace(/\s*-\s*$/, ` - ${fmt(player.currentTime)}`);
+  };
+}
+
+// Search. Dims non-matching lines rather than hiding them, so position in the
+// video stays legible.
+const find = document.getElementById('findText');
+if (find) {
+  find.oninput = () => {
+    const q = find.value.trim().toLowerCase();
+    lines.forEach(line => {
+      const hit = q && line.querySelector('.ttext').textContent.toLowerCase().includes(q);
+      line.classList.toggle('hit', !!hit);
+      line.classList.toggle('dim', !!q && !hit);
+    });
+  };
+}
+
+// Ticked suggestions become editable text, never a direct render.
+const useBtn = document.getElementById('useSuggestions');
+if (useBtn) {
+  useBtn.onclick = () => {
+    const picked = [...document.querySelectorAll('.sugg:checked')];
+    if (!picked.length) return;
+    box.value = '# Suggested clips. Edit freely, then check the list.\n'
+      + picked.map(c => `${fmt(+c.dataset.start)} - ${fmt(+c.dataset.end)} | ${c.dataset.title}`).join('\n')
+      + '\n';
+    box.scrollIntoView({behavior: 'smooth', block: 'center'});
+    box.focus();
+  };
+}
+</script>
+{% endif %}
+
+{% if job.status in ('uploading','uploaded','probing','transcribing','queued','rendering') %}
 <script>
 // Poll rather than refresh, so the page does not jump while it is being read.
 const total = {{ clips|length }};

@@ -52,6 +52,20 @@ class Settings:
     clip_retention_days: int = _int("CLIP_RETENTION_DAYS", 30)
     delete_source_after_render: bool = _bool("DELETE_SOURCE_AFTER_RENDER", True)
 
+    # --- transcription -----------------------------------------------------
+    # The transcript is what makes finding cut points practical; without it you
+    # scrub an hour of video by hand.
+    transcription_provider: str = os.getenv("TRANSCRIPTION_PROVIDER", "faster-whisper")
+    whisper_model_size: str = os.getenv("WHISPER_MODEL_SIZE", "base")
+
+    # --- clip suggestions --------------------------------------------------
+    # The LLM proposes segment ranges; timestamps always come from the
+    # transcript, never from the model. Off without an API key.
+    suggestions_enabled: bool = _bool("SUGGESTIONS_ENABLED", True) and bool(
+        os.getenv("ANTHROPIC_API_KEY")
+    )
+    suggestion_count: int = _int("SUGGESTION_COUNT", 8)
+
     max_upload_bytes: int = _int("MAX_UPLOAD_BYTES", 8 * 1024**3)
     upload_chunk_bytes: int = _int("UPLOAD_CHUNK_BYTES", 8 * 1024**2)
 

@@ -70,3 +70,24 @@ CREATE TABLE IF NOT EXISTS clips (
     UNIQUE (job_id, sequence)
 );
 CREATE INDEX IF NOT EXISTS clips_job_idx ON clips (job_id, sequence);
+
+-- Transcript, stored per segment so the UI can link to a line and the LLM
+-- suggester can address one by index instead of inventing a timestamp.
+CREATE TABLE IF NOT EXISTS transcript_segments (
+    id            BIGSERIAL PRIMARY KEY,
+    job_id        UUID NOT NULL REFERENCES jobs (id) ON DELETE CASCADE,
+    idx           INTEGER NOT NULL,
+    start_seconds DOUBLE PRECISION NOT NULL,
+    end_seconds   DOUBLE PRECISION NOT NULL,
+    text          TEXT NOT NULL,
+    words         JSONB,
+    UNIQUE (job_id, idx)
+);
+CREATE INDEX IF NOT EXISTS transcript_job_idx ON transcript_segments (job_id, idx);
+
+-- Added after the first release; ALTER ... IF NOT EXISTS keeps startup
+-- idempotent on databases created before these existed.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS transcript_language TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS transcript_error TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS suggestions JSONB;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS suggestion_error TEXT;

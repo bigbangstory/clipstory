@@ -156,6 +156,34 @@ def probe(path: Path, *, timeout: int = 120) -> MediaInfo:
     )
 
 
+def extract_audio(source: Path, destination: Path, *, timeout: int = 3600) -> Path:
+    """Pull the audio out as 16 kHz mono 16-bit PCM.
+
+    That format is what Whisper models expect, and converting once here means
+    the transcriber never has to think about the source's codec or channel
+    layout. It is also small: 32 KB/s, so about 115 MB per hour of video.
+    """
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-y",
+            "-i", str(source),
+            "-vn",                      # drop video, we only want the audio
+            "-acodec", "pcm_s16le",
+            "-ar", "16000",             # Whisper's native sample rate
+            "-ac", "1",                 # mono
+            str(destination),
+        ],
+        timeout=timeout,
+    )
+    if not destination.exists() or destination.stat().st_size == 0:
+        raise MediaError("audio extraction produced an empty file")
+    return destination
+
+
 def build_cut_command(
     source: Path, destination: Path, start: float, duration: float
 ) -> list[str]:

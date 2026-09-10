@@ -22,9 +22,17 @@ from typing import Any, Iterator
 
 from app import db
 from app.config import settings
-from app.media import CutVerificationError, MediaError, cut_clip, probe
+from app.media import CutVerificationError, MediaError, cut_clip, extract_audio, probe
 from app.naming import clip_filename
+from psycopg.types.json import Json
+
 from app.storage import LocalDiskStorage, Storage
+from app.suggest import SuggestionError, suggest_clips
+from app.transcription import (
+    TranscriptSegment,
+    TranscriptionError,
+    get_provider as get_transcription_provider,
+)
 from app.timestamps import CutRange, format_timestamp
 
 log = logging.getLogger(__name__)
@@ -32,13 +40,15 @@ log = logging.getLogger(__name__)
 UPLOADING = "uploading"
 UPLOADED = "uploaded"
 PROBING = "probing"
+TRANSCRIBING = "transcribing"
 AWAITING_CUTS = "awaiting_cuts"
 QUEUED = "queued"
 RENDERING = "rendering"
 COMPLETE = "complete"
 FAILED = "failed"
 
-# Statuses the worker will pick up.
+# Statuses the worker will pick up. PROBING covers the probe-plus-transcribe
+# stage; QUEUED covers rendering.
 CLAIMABLE = (UPLOADED, QUEUED)
 
 # A job left mid-flight by a crashed or restarted worker is returned to the
@@ -271,18 +281,154 @@ def probe_job(job: dict[str, Any]) -> None:
     db.execute(
         """
         UPDATE jobs SET duration_seconds = %s, width = %s, height = %s, fps = %s,
-                        variable_frame_rate = %s, status = %s, claimed_by = NULL,
-                        claimed_at = NULL, updated_at = now()
+                        variable_frame_rate = %s, status = %s, updated_at = now()
         WHERE id = %s
         """,
         (info.duration, info.width, info.height, info.fps,
-         info.variable_frame_rate, AWAITING_CUTS, job_id),
+         info.variable_frame_rate, TRANSCRIBING, job_id),
     )
     log.info(
         "job %s probed: %.1fs, %dx%d, %.3ffps%s",
         job_id, info.duration, info.width, info.height, info.fps,
         ", variable frame rate" if info.variable_frame_rate else "",
     )
+
+    # Transcription runs in the same claim: the worker already holds the job
+    # and the source file is already on disk.
+    transcribe_job(get_job(job_id))
+
+
+# ----------------------------------------------------------- transcribe ----
+
+def transcribe_job(job: dict[str, Any]) -> None:
+    """Transcribe the source, then ask for clip suggestions.
+
+    Neither is allowed to fail the job. A video with no speech, or a missing
+    API key, still leaves a perfectly usable tool: the operator types their own
+    timestamps as before. The reason is recorded and shown, not swallowed.
+    """
+    job_id = str(job["id"])
+    store = storage()
+    source = store.path_for(job["source_path"])
+    audio_key = f"sources/{job_id}/audio.wav"
+
+    segments: list = []
+    language = None
+    transcript_error = None
+
+    try:
+        audio = extract_audio(
+            source, store.path_for(audio_key), timeout=settings.ffmpeg_timeout_seconds
+        )
+        segments, language = get_transcription_provider().transcribe(audio)
+    except (MediaError, TranscriptionError) as exc:
+        transcript_error = str(exc)
+        log.warning("job %s could not be transcribed: %s", job_id, exc)
+    except Exception as exc:  # noqa: BLE001 - a provider may raise anything
+        transcript_error = f"unexpected transcription error: {exc}"
+        log.exception("job %s transcription crashed", job_id)
+    finally:
+        # The WAV is only an intermediate. It is up to 115 MB per hour and has
+        # no value once the text exists.
+        store.delete(audio_key)
+
+    if segments:
+        with db.connection() as conn:
+            conn.execute("DELETE FROM transcript_segments WHERE job_id = %s", (job_id,))
+            for segment in segments:
+                conn.execute(
+                    """
+                    INSERT INTO transcript_segments
+                        (job_id, idx, start_seconds, end_seconds, text, words)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        job_id,
+                        segment.index,
+                        segment.start,
+                        segment.end,
+                        segment.text,
+                        Json([{"s": w.start, "e": w.end, "t": w.text} for w in segment.words]),
+                    ),
+                )
+
+    suggestions_payload = None
+    suggestion_error = None
+    if segments and settings.suggestions_enabled:
+        try:
+            suggestions = suggest_clips(segments, target_count=settings.suggestion_count)
+            suggestions_payload = Json([
+                {
+                    "start": s.start,
+                    "end": s.end,
+                    "title": s.title,
+                    "reason": s.reason,
+                    "start_segment": s.start_segment,
+                    "end_segment": s.end_segment,
+                }
+                for s in suggestions
+            ])
+        except SuggestionError as exc:
+            suggestion_error = str(exc)
+            log.warning("job %s got no suggestions: %s", job_id, exc)
+        except Exception as exc:  # noqa: BLE001
+            suggestion_error = f"unexpected error: {exc}"
+            log.exception("job %s suggestion step crashed", job_id)
+
+    db.execute(
+        """
+        UPDATE jobs SET status = %s, transcript_language = %s, transcript_error = %s,
+                        suggestions = %s, suggestion_error = %s,
+                        claimed_by = NULL, claimed_at = NULL, updated_at = now()
+        WHERE id = %s
+        """,
+        (AWAITING_CUTS, language, transcript_error,
+         suggestions_payload, suggestion_error, job_id),
+    )
+
+
+def save_suggestions(job_id: str, suggestions, error: str | None) -> None:
+    db.execute(
+        """
+        UPDATE jobs SET suggestions = %s, suggestion_error = %s, updated_at = now()
+        WHERE id = %s
+        """,
+        (
+            Json([
+                {
+                    "start": s.start, "end": s.end, "title": s.title,
+                    "reason": s.reason, "start_segment": s.start_segment,
+                    "end_segment": s.end_segment,
+                }
+                for s in suggestions
+            ]) if suggestions else Json([]),
+            error,
+            job_id,
+        ),
+    )
+
+
+def get_transcript(job_id: str) -> list[dict[str, Any]]:
+    return db.query(
+        """
+        SELECT idx, start_seconds, end_seconds, text
+        FROM transcript_segments WHERE job_id = %s ORDER BY idx
+        """,
+        (job_id,),
+    )
+
+
+def transcript_segments_for(job_id: str) -> list[TranscriptSegment]:
+    """Rebuild provider objects from the database, for re-running suggestions."""
+    return [
+        TranscriptSegment(
+            index=row["idx"],
+            start=float(row["start_seconds"]),
+            end=float(row["end_seconds"]),
+            text=row["text"],
+        )
+        for row in get_transcript(job_id)
+    ]
 
 
 # ---------------------------------------------------------------- render ----

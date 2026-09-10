@@ -26,6 +26,7 @@ from starlette.background import BackgroundTask
 from app import auth, db, jobs
 from app.config import settings
 from app.naming import clip_filename, zip_filename
+from app.suggest import SuggestionError, suggest_clips
 from app.timestamps import (
     TimestampError,
     find_overlaps,
@@ -201,13 +202,25 @@ def job_detail(job_id: str, request: Request, user: dict = Depends(require_user)
     job = jobs.get_job_for_user(job_id, user)
     if job is None:
         raise HTTPException(404, "job not found")
-    clips = jobs.get_clips(job_id)
     return templates.TemplateResponse(
-        request,
-        "job.html",
-        {"user": user, "job": job, "clips": clips,
-         "retention_days": settings.clip_retention_days},
+        request, "job.html", _job_context(job, user)
     )
+
+
+def _job_context(job: dict, user: dict) -> dict[str, Any]:
+    job_id = str(job["id"])
+    return {
+        "user": user,
+        "job": job,
+        "clips": jobs.get_clips(job_id),
+        "transcript": jobs.get_transcript(job_id),
+        "suggestions": job.get("suggestions") or [],
+        "retention_days": settings.clip_retention_days,
+        "suggestions_enabled": settings.suggestions_enabled,
+        # The source is deleted once clips render, so playback is only offered
+        # while the file is actually still there.
+        "source_available": bool(job["source_path"]) and not job["source_deleted_at"],
+    }
 
 
 @app.get("/jobs/{job_id}/status")
@@ -221,6 +234,7 @@ def job_status(job_id: str, user: dict = Depends(require_user)):
     return {
         "status": job["status"],
         "error": job["error"],
+        "transcript_ready": bool(job["transcript_language"]) or bool(job["transcript_error"]),
         "clip_count": len(clips),
         "clips_done": done,
         "clips": [
@@ -336,11 +350,7 @@ def submit_cuts(
         raise HTTPException(404, "job not found")
 
     duration = float(job["duration_seconds"]) if job["duration_seconds"] else None
-    context = {
-        "user": user, "job": job,
-        "clips": jobs.get_clips(job_id), "cuts_text": cuts,
-        "retention_days": settings.clip_retention_days,
-    }
+    context = _job_context(job, user) | {"cuts_text": cuts}
 
     try:
         ranges = parse_cut_list(cuts, source_duration=duration)
@@ -364,6 +374,44 @@ def submit_cuts(
         return templates.TemplateResponse(request, "job.html", context)
 
     jobs.set_cuts(job_id, ranges)
+    return RedirectResponse(f"/jobs/{job_id}", status_code=303)
+
+
+@app.get("/jobs/{job_id}/source")
+def stream_source(job_id: str, user: dict = Depends(require_user)):
+    """Serve the source video so the operator can scrub it beside the transcript.
+
+    FileResponse honours Range requests, which is what lets the player seek
+    without downloading gigabytes first.
+    """
+    job = jobs.get_job_for_user(job_id, user)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    if not job["source_path"] or job["source_deleted_at"]:
+        raise HTTPException(410, "the source video has been deleted")
+    path = jobs.storage().path_for(job["source_path"])
+    if not path.exists():
+        raise HTTPException(410, "the source video is no longer on disk")
+    return FileResponse(path, media_type="video/mp4")
+
+
+@app.post("/jobs/{job_id}/suggest")
+def rerun_suggestions(job_id: str, request: Request, user: dict = Depends(require_user)):
+    """Ask the model again. Cheap, and useful when the first pass missed."""
+    job = jobs.get_job_for_user(job_id, user)
+    if job is None:
+        raise HTTPException(404, "job not found")
+
+    segments = jobs.transcript_segments_for(job_id)
+    if not segments:
+        raise HTTPException(409, "this job has no transcript to analyse")
+
+    try:
+        suggestions = suggest_clips(segments, target_count=settings.suggestion_count)
+        jobs.save_suggestions(job_id, suggestions, None)
+    except SuggestionError as exc:
+        jobs.save_suggestions(job_id, [], str(exc))
+
     return RedirectResponse(f"/jobs/{job_id}", status_code=303)
 
 
