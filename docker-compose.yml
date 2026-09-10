@@ -1,9 +1,15 @@
-# One command brings up the whole service: database, web, worker.
+# One command brings up the whole service: database, local LLM, web, worker.
 #
-# The web and worker run the same image with different commands. They share the
-# clipstory-data volume because the worker writes clips that the web process
-# serves, and they coordinate through Postgres rather than through the
-# filesystem.
+# web and worker run the same image with different commands. They share the
+# clipstory-data volume (the worker writes clips the web process serves) and
+# coordinate through Postgres. Nothing is exposed to the internet; Cloudflare
+# Tunnel connects outbound to the web port on localhost.
+
+x-app-env: &app-env
+  DATABASE_URL: postgresql://clipstory:${POSTGRES_PASSWORD}@db:5432/clipstory
+  DATA_DIR: /data
+  HF_HOME: /data/models/hf
+  OLLAMA_URL: http://ollama:11434
 
 services:
   db:
@@ -20,21 +26,48 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-    # Not published to the host. Only the app containers reach it.
     expose:
       - "5432"
 
+  # The local language model that picks clips. Official image is multi-arch
+  # (linux/arm64 included). Models persist in their own volume.
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollama-models:/root/.ollama
+    expose:
+      - "11434"
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+
+  # One-shot: pulls the model on first start (a few GB, once), then exits.
+  # Idempotent, so it is harmless on every later `docker compose up`.
+  ollama-pull:
+    image: ollama/ollama:latest
+    entrypoint: ["sh", "-c", "ollama pull ${SUGGEST_MODEL:-qwen2.5:7b-instruct}"]
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: "no"
+
   web:
-    build: .
+    build:
+      context: .
+      args:
+        WHISPER_MODEL_SIZE: ${WHISPER_MODEL_SIZE:-base}
     restart: unless-stopped
     env_file: .env
     environment:
-      DATABASE_URL: postgresql://clipstory:${POSTGRES_PASSWORD}@db:5432/clipstory
-      DATA_DIR: /data
+      <<: *app-env
     volumes:
       - clipstory-data:/data
-    # Bound to localhost only. Cloudflare Tunnel connects outbound, so the VM
-    # never needs an inbound port open to the internet.
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
@@ -48,20 +81,24 @@ services:
       start_period: 30s
 
   worker:
-    build: .
+    build:
+      context: .
+      args:
+        WHISPER_MODEL_SIZE: ${WHISPER_MODEL_SIZE:-base}
     restart: unless-stopped
     command: python -m app.worker
     env_file: .env
     environment:
-      DATABASE_URL: postgresql://clipstory:${POSTGRES_PASSWORD}@db:5432/clipstory
-      DATA_DIR: /data
+      <<: *app-env
     volumes:
       - clipstory-data:/data
     depends_on:
       db:
         condition: service_healthy
-    # ffmpeg will use every core it is given. Capping leaves the web process
-    # responsive while a render is running on a 2-core box.
+      ollama:
+        condition: service_healthy
+    # ffmpeg and Whisper use every core they are given. Capping leaves the
+    # web process responsive while a job runs on a 2-core box.
     deploy:
       resources:
         limits:
@@ -70,3 +107,4 @@ services:
 volumes:
   clipstory-db:
   clipstory-data:
+  ollama-models:

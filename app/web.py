@@ -1,8 +1,8 @@
 """HTTP layer.
 
-Nothing here does slow work. Uploads stream to disk chunk by chunk, and probing
-and rendering are handed to the worker through the jobs table. The longest
-thing a request does is write one 8 MB chunk.
+Nothing here does slow work. Uploads stream to disk chunk by chunk; probing,
+transcription, suggestion and rendering are all handed to the worker through
+the jobs table. The longest thing a request does is write one 8 MB chunk.
 """
 from __future__ import annotations
 
@@ -14,29 +14,21 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response, status
-from fastapi.responses import (
-    FileResponse,
-    HTMLResponse,
-    JSONResponse,
-    RedirectResponse,
-)
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
 from app import auth, db, jobs
 from app.config import settings
-from app.naming import clip_filename, zip_filename
-from app.suggest import SuggestionError, suggest_clips
-from app.timestamps import (
-    TimestampError,
-    find_overlaps,
-    format_timestamp,
-    parse_cut_list,
-)
+from app.naming import zip_filename
+from app.timestamps import MIN_CLIP_SECONDS, TimestampError, format_timestamp, parse_cut_list
 
 log = logging.getLogger(__name__)
 
-templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+HERE = Path(__file__).parent
+templates = Jinja2Templates(directory=str(HERE / "templates"))
 templates.env.filters["timestamp"] = lambda value: format_timestamp(float(value or 0))
 
 
@@ -52,6 +44,7 @@ def human_bytes(value: Any) -> str:
 templates.env.filters["human_bytes"] = human_bytes
 
 app = FastAPI(title="Clipstory", docs_url=None, redoc_url=None)
+app.mount("/static", StaticFiles(directory=str(HERE / "static")), name="static")
 
 
 @app.on_event("startup")
@@ -95,17 +88,12 @@ def require_admin(request: Request) -> dict[str, Any]:
 # these must come back as JSON so the page's own error handling can read them;
 # everywhere else a human is looking at a browser window and wants a page.
 JSON_PATH_PREFIXES = ("/api/", "/healthz")
-JSON_PATH_SUFFIXES = ("/status", ".json")
+JSON_PATH_SUFFIXES = ("/status", ".json", "/apply")
 
 
 def wants_json(request: Request) -> bool:
     path = request.url.path
-    if path.startswith(JSON_PATH_PREFIXES) or path.endswith(JSON_PATH_SUFFIXES):
-        return True
-    # Deciding by path rather than by the Accept header, because Accept varies
-    # between browsers, fetch() calls and command-line clients, and getting it
-    # wrong means a signed-out person sees raw JSON instead of a login page.
-    return False
+    return path.startswith(JSON_PATH_PREFIXES) or path.endswith(JSON_PATH_SUFFIXES)
 
 
 @app.exception_handler(HTTPException)
@@ -116,8 +104,7 @@ async def handle_http_exception(request: Request, exc: HTTPException):
     if exc.status_code == 401:
         return RedirectResponse("/login", status_code=303)
     return templates.TemplateResponse(
-        request,
-        "error.html",
+        request, "error.html",
         {"user": current_user(request), "code": exc.status_code, "detail": exc.detail},
         status_code=exc.status_code,
     )
@@ -157,14 +144,10 @@ def verify(token: str):
             "/login?error=That+link+is+invalid+or+has+expired.+Request+a+new+one.",
             status_code=303,
         )
-
     response = RedirectResponse("/", status_code=303)
     response.set_cookie(
-        auth.SESSION_COOKIE,
-        auth.issue_session(user),
-        max_age=settings.session_ttl_days * 86400,
-        httponly=True,
-        samesite="lax",
+        auth.SESSION_COOKIE, auth.issue_session(user),
+        max_age=settings.session_ttl_days * 86400, httponly=True, samesite="lax",
         secure=settings.base_url.startswith("https://"),
     )
     return response
@@ -189,12 +172,46 @@ def index(request: Request, user: dict = Depends(require_user)):
 @app.get("/jobs/new", response_class=HTMLResponse)
 def new_job(request: Request, user: dict = Depends(require_user)):
     return templates.TemplateResponse(
-        request,
-        "new.html",
-        {"user": user,
-         "chunk_bytes": settings.upload_chunk_bytes,
+        request, "new.html",
+        {"user": user, "chunk_bytes": settings.upload_chunk_bytes,
          "max_bytes": settings.max_upload_bytes},
     )
+
+
+def _job_context(job: dict, user: dict, **extra: Any) -> dict[str, Any]:
+    job_id = str(job["id"])
+    clips = jobs.get_clips(job_id)
+    editable = job["status"] in jobs.EDITABLE
+    return {
+        "user": user,
+        "job": job,
+        "clips": clips,
+        "transcript": jobs.get_transcript(job_id),
+        "suggestions": job.get("suggestions") or [],
+        "editable": editable,
+        "retention_days": settings.clip_retention_days,
+        "suggestions_enabled": settings.suggestions_enabled,
+        # The source is deleted on finalise, so playback is only offered while
+        # the file is actually still there.
+        "source_available": bool(job["source_path"]) and not job["source_deleted_at"],
+        # Everything the review page's script needs, as one JSON blob.
+        "review_data": {
+            "jobId": job_id,
+            "duration": float(job["duration_seconds"] or 0),
+            "editable": editable,
+            "words": jobs.get_word_boundaries(job_id) if editable else [],
+            "clips": [
+                {
+                    "id": c["id"], "sequence": c["sequence"], "label": c["label"] or "",
+                    "start": float(c["start_seconds"]), "end": float(c["end_seconds"]),
+                    "status": c["status"], "filename": c["output_filename"],
+                    "error": c["error"],
+                }
+                for c in clips
+            ],
+        },
+        **extra,
+    }
 
 
 @app.get("/jobs/{job_id}", response_class=HTMLResponse)
@@ -202,25 +219,7 @@ def job_detail(job_id: str, request: Request, user: dict = Depends(require_user)
     job = jobs.get_job_for_user(job_id, user)
     if job is None:
         raise HTTPException(404, "job not found")
-    return templates.TemplateResponse(
-        request, "job.html", _job_context(job, user)
-    )
-
-
-def _job_context(job: dict, user: dict) -> dict[str, Any]:
-    job_id = str(job["id"])
-    return {
-        "user": user,
-        "job": job,
-        "clips": jobs.get_clips(job_id),
-        "transcript": jobs.get_transcript(job_id),
-        "suggestions": job.get("suggestions") or [],
-        "retention_days": settings.clip_retention_days,
-        "suggestions_enabled": settings.suggestions_enabled,
-        # The source is deleted once clips render, so playback is only offered
-        # while the file is actually still there.
-        "source_available": bool(job["source_path"]) and not job["source_deleted_at"],
-    }
+    return templates.TemplateResponse(request, "job.html", _job_context(job, user))
 
 
 @app.get("/jobs/{job_id}/status")
@@ -230,27 +229,35 @@ def job_status(job_id: str, user: dict = Depends(require_user)):
     if job is None:
         raise HTTPException(404, "job not found")
     clips = jobs.get_clips(job_id)
-    done = sum(1 for c in clips if c["status"] == "complete")
     return {
         "status": job["status"],
         "error": job["error"],
-        "transcript_ready": bool(job["transcript_language"]) or bool(job["transcript_error"]),
         "clip_count": len(clips),
-        "clips_done": done,
-        "clips": [
-            {"sequence": c["sequence"], "status": c["status"],
-             "filename": c["output_filename"], "error": c["error"]}
-            for c in clips
-        ],
+        "clips_done": sum(1 for c in clips if c["status"] == jobs.CLIP_COMPLETE),
+        "clips": [{"id": c["id"], "sequence": c["sequence"], "status": c["status"]} for c in clips],
     }
+
+
+@app.get("/jobs/{job_id}/source")
+def stream_source(job_id: str, user: dict = Depends(require_user)):
+    """The source video, for scrubbing beside the transcript. FileResponse
+    honours Range requests, which is what lets the player seek."""
+    job = jobs.get_job_for_user(job_id, user)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    if not job["source_path"] or job["source_deleted_at"]:
+        raise HTTPException(410, "the source video has been deleted")
+    path = jobs.storage().path_for(job["source_path"])
+    if not path.exists():
+        raise HTTPException(410, "the source video is no longer on disk")
+    return FileResponse(path, media_type="video/mp4")
 
 
 # ------------------------------------------------------------------ upload --
 
 @app.post("/api/uploads")
 def upload_init(
-    filename: str = Form(...),
-    total_bytes: int = Form(...),
+    filename: str = Form(...), total_bytes: int = Form(...),
     user: dict = Depends(require_user),
 ):
     """Open an upload. The browser then sends the file in chunks.
@@ -263,21 +270,17 @@ def upload_init(
         raise HTTPException(400, "file appears to be empty")
     if total_bytes > settings.max_upload_bytes:
         raise HTTPException(
-            413,
-            f"file is {human_bytes(total_bytes)}, over the "
-            f"{human_bytes(settings.max_upload_bytes)} limit",
+            413, f"file is {human_bytes(total_bytes)}, over the "
+                 f"{human_bytes(settings.max_upload_bytes)} limit",
         )
-
     free = jobs.storage().free_bytes()
     # Room for the source plus its clips, with margin. Refusing here gives a
     # clear message instead of an ffmpeg failure halfway through a render.
     if free < total_bytes * 1.5:
         raise HTTPException(
-            507,
-            f"not enough disk space: {human_bytes(free)} free, "
-            f"about {human_bytes(total_bytes * 1.5)} needed",
+            507, f"not enough disk space: {human_bytes(free)} free, "
+                 f"about {human_bytes(total_bytes * 1.5)} needed",
         )
-
     job = jobs.create_job(user["id"], Path(filename).name, total_bytes)
     return {"job_id": str(job["id"]), "chunk_bytes": settings.upload_chunk_bytes}
 
@@ -288,11 +291,8 @@ def upload_status(job_id: str, user: dict = Depends(require_user)):
     job = jobs.get_job_for_user(job_id, user)
     if job is None:
         raise HTTPException(404, "upload not found")
-    return {
-        "received_bytes": int(job["received_bytes"]),
-        "total_bytes": int(job["source_bytes"]),
-        "status": job["status"],
-    }
+    return {"received_bytes": int(job["received_bytes"]),
+            "total_bytes": int(job["source_bytes"]), "status": job["status"]}
 
 
 @app.put("/api/uploads/{job_id}")
@@ -300,21 +300,17 @@ async def upload_chunk(job_id: str, request: Request, user: dict = Depends(requi
     job = jobs.get_job_for_user(job_id, user)
     if job is None:
         raise HTTPException(404, "upload not found")
-
     try:
         offset = int(request.headers.get("x-chunk-offset", ""))
     except ValueError:
         raise HTTPException(400, "missing or invalid X-Chunk-Offset header")
-
     data = await request.body()
     if not data:
         raise HTTPException(400, "empty chunk")
-
     try:
         received = jobs.append_upload_chunk(job_id, offset, data)
     except ValueError as exc:
         raise HTTPException(409, str(exc))
-
     return {"received_bytes": received, "total_bytes": int(job["source_bytes"])}
 
 
@@ -330,88 +326,111 @@ def upload_complete(job_id: str, user: dict = Depends(require_user)):
     return {"job_id": job_id, "status": jobs.UPLOADED}
 
 
-# -------------------------------------------------------------------- cuts --
+# ------------------------------------------------------------------ review --
+
+class ClipRow(BaseModel):
+    id: int | None = None
+    start: float = Field(ge=0)
+    end: float = Field(gt=0)
+    label: str | None = None
+
+
+class ApplyRequest(BaseModel):
+    rows: list[ClipRow]
+
+
+def _validate_rows(rows: list[ClipRow], duration: float | None) -> list[jobs.ClipEdit]:
+    """The same rules the text parser applies, for rows arriving as JSON."""
+    edits = []
+    for number, row in enumerate(rows, start=1):
+        if row.start >= row.end:
+            raise HTTPException(400, f"clip {number}: start must be before end")
+        if row.end - row.start < MIN_CLIP_SECONDS:
+            raise HTTPException(400, f"clip {number}: shorter than {MIN_CLIP_SECONDS}s")
+        if duration and row.end > duration + 0.001:
+            raise HTTPException(
+                400, f"clip {number}: ends at {format_timestamp(row.end)}, past the "
+                     f"end of the video ({format_timestamp(duration)})",
+            )
+        label = (row.label or "").strip() or None
+        edits.append(jobs.ClipEdit(start=round(row.start, 3), end=round(row.end, 3),
+                                   label=label, id=row.id))
+    return edits
+
+
+@app.post("/jobs/{job_id}/apply")
+def apply_edits(job_id: str, body: ApplyRequest, user: dict = Depends(require_user)):
+    """The review page's save. Only clips that changed get re-rendered."""
+    job = jobs.get_job_for_user(job_id, user)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    edits = _validate_rows(body.rows, job["duration_seconds"])
+    try:
+        counts = jobs.apply_clip_edits(job_id, edits)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+    return {"counts": counts, "status": jobs.get_job(job_id)["status"]}
+
 
 @app.post("/jobs/{job_id}/cuts", response_class=HTMLResponse)
 def submit_cuts(
-    job_id: str,
-    request: Request,
-    cuts: str = Form(...),
-    confirm: str = Form(default=""),
+    job_id: str, request: Request, cuts: str = Form(...),
     user: dict = Depends(require_user),
 ):
-    """Parse the pasted cut list, show it for confirmation, then queue it.
-
-    Two passes on purpose. The operator sees exactly what was understood before
-    a single frame is rendered, which is where a mistyped timestamp gets caught.
-    """
+    """The text-box path. Parsed with the same rules, then applied as edits, so
+    a line that exactly matches an existing clip leaves it untouched."""
     job = jobs.get_job_for_user(job_id, user)
     if job is None:
         raise HTTPException(404, "job not found")
-
     duration = float(job["duration_seconds"]) if job["duration_seconds"] else None
-    context = _job_context(job, user) | {"cuts_text": cuts}
-
     try:
         ranges = parse_cut_list(cuts, source_duration=duration)
     except TimestampError as exc:
-        context |= {"parse_error": exc.message, "error_line_number": exc.line_number,
-                    "error_line": exc.line}
-        return templates.TemplateResponse(request, "job.html", context, status_code=400)
+        return templates.TemplateResponse(
+            request, "job.html",
+            _job_context(job, user, cuts_text=cuts, parse_error=exc.message,
+                         error_line_number=exc.line_number, error_line=exc.line),
+            status_code=400,
+        )
     except ValueError as exc:
-        context |= {"parse_error": str(exc)}
-        return templates.TemplateResponse(request, "job.html", context, status_code=400)
-
-    if confirm != "yes":
-        # Show the filenames the renderer will actually produce, computed with
-        # the same function it uses. Anything approximated here would be a
-        # promise the render does not keep.
-        preview = [
-            (cut, clip_filename(job["source_filename"], cut.sequence, len(ranges), cut.label))
-            for cut in ranges
-        ]
-        context |= {"preview": preview, "overlaps": find_overlaps(ranges)}
-        return templates.TemplateResponse(request, "job.html", context)
-
-    jobs.set_cuts(job_id, ranges)
+        return templates.TemplateResponse(
+            request, "job.html",
+            _job_context(job, user, cuts_text=cuts, parse_error=str(exc)),
+            status_code=400,
+        )
+    try:
+        jobs.apply_clip_edits(
+            job_id, [jobs.ClipEdit(start=r.start, end=r.end, label=r.label) for r in ranges]
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
     return RedirectResponse(f"/jobs/{job_id}", status_code=303)
 
 
-@app.get("/jobs/{job_id}/source")
-def stream_source(job_id: str, user: dict = Depends(require_user)):
-    """Serve the source video so the operator can scrub it beside the transcript.
-
-    FileResponse honours Range requests, which is what lets the player seek
-    without downloading gigabytes first.
-    """
-    job = jobs.get_job_for_user(job_id, user)
-    if job is None:
-        raise HTTPException(404, "job not found")
-    if not job["source_path"] or job["source_deleted_at"]:
-        raise HTTPException(410, "the source video has been deleted")
-    path = jobs.storage().path_for(job["source_path"])
-    if not path.exists():
-        raise HTTPException(410, "the source video is no longer on disk")
-    return FileResponse(path, media_type="video/mp4")
-
-
 @app.post("/jobs/{job_id}/suggest")
-def rerun_suggestions(job_id: str, request: Request, user: dict = Depends(require_user)):
-    """Ask the model again. Cheap, and useful when the first pass missed."""
+def rerun_suggestions(job_id: str, user: dict = Depends(require_user)):
+    """Queue another suggestion pass. The worker does it; nothing waits here."""
     job = jobs.get_job_for_user(job_id, user)
     if job is None:
         raise HTTPException(404, "job not found")
-
-    segments = jobs.transcript_segments_for(job_id)
-    if not segments:
+    if not jobs.get_transcript(job_id):
         raise HTTPException(409, "this job has no transcript to analyse")
-
     try:
-        suggestions = suggest_clips(segments, target_count=settings.suggestion_count)
-        jobs.save_suggestions(job_id, suggestions, None)
-    except SuggestionError as exc:
-        jobs.save_suggestions(job_id, [], str(exc))
+        jobs.request_suggestions(job_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+    return RedirectResponse(f"/jobs/{job_id}", status_code=303)
 
+
+@app.post("/jobs/{job_id}/finalise")
+def finalise(job_id: str, user: dict = Depends(require_user)):
+    job = jobs.get_job_for_user(job_id, user)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    try:
+        jobs.finalise_job(job_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
     return RedirectResponse(f"/jobs/{job_id}", status_code=303)
 
 
@@ -422,9 +441,7 @@ def download_clip(job_id: str, clip_id: int, user: dict = Depends(require_user))
     job = jobs.get_job_for_user(job_id, user)
     if job is None:
         raise HTTPException(404, "job not found")
-    clip = db.query_one(
-        "SELECT * FROM clips WHERE id = %s AND job_id = %s", (clip_id, job_id)
-    )
+    clip = db.query_one("SELECT * FROM clips WHERE id = %s AND job_id = %s", (clip_id, job_id))
     if clip is None or not clip["output_path"]:
         raise HTTPException(404, "clip not found")
     path = jobs.storage().path_for(clip["output_path"])
@@ -438,10 +455,8 @@ def download_manifest(job_id: str, user: dict = Depends(require_user)):
     job = jobs.get_job_for_user(job_id, user)
     if job is None:
         raise HTTPException(404, "job not found")
-    return JSONResponse(
-        jobs.build_manifest(job),
-        headers={"Content-Disposition": 'attachment; filename="manifest.json"'},
-    )
+    return JSONResponse(jobs.build_manifest(job),
+                        headers={"Content-Disposition": 'attachment; filename="manifest.json"'})
 
 
 @app.get("/jobs/{job_id}/download.zip")
@@ -449,8 +464,7 @@ def download_zip(job_id: str, user: dict = Depends(require_user)):
     job = jobs.get_job_for_user(job_id, user)
     if job is None:
         raise HTTPException(404, "job not found")
-
-    clips = [c for c in jobs.get_clips(job_id) if c["status"] == "complete"]
+    clips = [c for c in jobs.get_clips(job_id) if c["status"] == jobs.CLIP_COMPLETE]
     if not clips:
         raise HTTPException(404, "this job has no rendered clips")
 
@@ -458,12 +472,9 @@ def download_zip(job_id: str, user: dict = Depends(require_user)):
     # Built on demand into a temp file and deleted once sent, so a batch never
     # occupies disk twice for longer than the download takes. MP4 is already
     # compressed, so ZIP_STORED avoids pointless CPU on a 2-core box.
-    handle = tempfile.NamedTemporaryFile(
-        suffix=".zip", dir=settings.data_dir, delete=False
-    )
+    handle = tempfile.NamedTemporaryFile(suffix=".zip", dir=settings.data_dir, delete=False)
     handle.close()
     archive_path = Path(handle.name)
-
     try:
         with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_STORED) as archive:
             for clip in clips:
@@ -474,10 +485,8 @@ def download_zip(job_id: str, user: dict = Depends(require_user)):
     except Exception:
         archive_path.unlink(missing_ok=True)
         raise
-
     return FileResponse(
-        archive_path,
-        media_type="application/zip",
+        archive_path, media_type="application/zip",
         filename=zip_filename(job["source_filename"]),
         background=BackgroundTask(archive_path.unlink, missing_ok=True),
     )
@@ -488,8 +497,7 @@ def download_zip(job_id: str, user: dict = Depends(require_user)):
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page(request: Request, user: dict = Depends(require_admin)):
     return templates.TemplateResponse(
-        request,
-        "admin.html",
+        request, "admin.html",
         {"user": user, "invites": auth.list_invites(),
          "email_configured": bool(settings.resend_api_key)},
     )
@@ -511,11 +519,7 @@ def admin_revoke(email: str = Form(...), user: dict = Depends(require_admin)):
 
 @app.get("/healthz")
 def healthz(response: Response):
-    """Liveness for the tunnel and for any uptime check.
-
-    Cheap on purpose: the web process never blocks on ffmpeg, so if this stops
-    answering something is genuinely wrong.
-    """
+    """Liveness for the tunnel and for any uptime check."""
     try:
         db.query_one("SELECT 1 AS ok")
     except Exception as exc:  # noqa: BLE001

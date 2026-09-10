@@ -127,6 +127,13 @@ for now, S3-compatible for R2 or Supabase later. Swapping is then one class, and
 this is the single decision that keeps the free-tier choice from becoming a
 rewrite when you start paying.
 
+## Note on the local LLM
+
+The clip picker now also runs on the VM (Ollama, `qwen2.5:7b-instruct`, about
+4.7 GB on disk, 5 to 6 GB RAM while answering). It fits the 12 GB Always Free
+allocation because the worker never runs it at the same time as Whisper. Speed
+on two ARM cores is unmeasured; `docs/DEPLOY.md` step 7 says what to record.
+
 ## What changes in the spec
 
 Nothing architectural. `docs/REQUIREMENTS.md` still describes one container

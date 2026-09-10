@@ -1,4 +1,9 @@
-"""Configuration, read once from the environment at import."""
+"""Configuration, read once from the environment at import.
+
+This is the only module that reads environment variables for application
+settings. Everything else imports ``settings``. Keeping one reader means one
+place to document a key and no two defaults that agree by coincidence.
+"""
 from __future__ import annotations
 
 import os
@@ -33,8 +38,8 @@ class Settings:
 
     base_url: str = os.getenv("BASE_URL", "http://localhost:8000").rstrip("/")
 
-    # Seeded into the invite list and given the admin flag on first start, so a
-    # fresh deployment has someone who can invite everyone else.
+    # Seeded into the invite list and given the admin flag on first sign-in,
+    # so a fresh deployment has someone who can invite everyone else.
     admin_emails: list[str] = field(default_factory=lambda: _csv("ADMIN_EMAILS"))
 
     # Email delivery. Without an API key the app logs magic links instead of
@@ -46,35 +51,53 @@ class Settings:
     login_token_ttl_minutes: int = _int("LOGIN_TOKEN_TTL_MINUTES", 20)
     session_ttl_days: int = _int("SESSION_TTL_DAYS", 30)
 
-    # Retention, per the agreed policy: the source is the expensive object and
-    # is dropped as soon as its clips render. A failed job keeps its source so
-    # it can be retried without re-uploading.
+    # Retention. The source video stays until the operator finalises the job,
+    # because tweaking a clip needs it. Finalising deletes the source; clips
+    # and the job itself are purged this many days after rendering.
     clip_retention_days: int = _int("CLIP_RETENTION_DAYS", 30)
-    delete_source_after_render: bool = _bool("DELETE_SOURCE_AFTER_RENDER", True)
 
     # --- transcription -----------------------------------------------------
-    # The transcript is what makes finding cut points practical; without it you
-    # scrub an hour of video by hand.
+    # "faster-whisper" runs on this machine at no per-video cost; "disabled"
+    # skips straight to the manual cut tools.
     transcription_provider: str = os.getenv("TRANSCRIPTION_PROVIDER", "faster-whisper")
     whisper_model_size: str = os.getenv("WHISPER_MODEL_SIZE", "base")
+    whisper_device: str = os.getenv("WHISPER_DEVICE", "cpu")
+    whisper_compute_type: str = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+    # Whisper on two ARM cores runs at roughly real time, so an hour of video
+    # needs about an hour. Three hours leaves room for a slow box.
+    transcription_timeout_seconds: int = _int("TRANSCRIPTION_TIMEOUT_SECONDS", 3 * 3600)
 
     # --- clip suggestions --------------------------------------------------
-    # The LLM proposes segment ranges; timestamps always come from the
-    # transcript, never from the model. Off without an API key.
-    suggestions_enabled: bool = _bool("SUGGESTIONS_ENABLED", True) and bool(
-        os.getenv("ANTHROPIC_API_KEY")
-    )
+    # "ollama" is a local model on this machine (default, free). "anthropic"
+    # is the hosted Claude API and needs ANTHROPIC_API_KEY. "disabled" turns
+    # the feature off. Whichever is used, the model returns transcript segment
+    # numbers and never a timestamp.
+    suggest_provider: str = os.getenv("SUGGEST_PROVIDER", "ollama")
+    # Empty means the provider's own default: qwen2.5:7b-instruct for Ollama,
+    # claude-opus-5 for Anthropic.
+    suggest_model: str = os.getenv("SUGGEST_MODEL", "")
+    ollama_url: str = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
+    # Context window given to the local model. A one-hour transcript is about
+    # 13k tokens; transcripts longer than fit are processed in windows. Larger
+    # values cost RAM for the KV cache.
+    ollama_num_ctx: int = _int("OLLAMA_NUM_CTX", 16384)
+    anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
     suggestion_count: int = _int("SUGGESTION_COUNT", 8)
+    suggest_timeout_seconds: int = _int("SUGGEST_TIMEOUT_SECONDS", 1800)
 
     max_upload_bytes: int = _int("MAX_UPLOAD_BYTES", 8 * 1024**3)
     upload_chunk_bytes: int = _int("UPLOAD_CHUNK_BYTES", 8 * 1024**2)
 
-    # Renders per job run one after another. At the agreed 5 to 10 clips a job
-    # finishes in minutes, and sequential keeps memory and CPU predictable on a
-    # 2-core box. Raise only with measured timings in hand.
-    render_concurrency: int = _int("RENDER_CONCURRENCY", 1)
     worker_poll_seconds: int = _int("WORKER_POLL_SECONDS", 3)
     ffmpeg_timeout_seconds: int = _int("FFMPEG_TIMEOUT_SECONDS", 3600)
+
+    @property
+    def suggestions_enabled(self) -> bool:
+        if self.suggest_provider == "disabled":
+            return False
+        if self.suggest_provider == "anthropic":
+            return bool(self.anthropic_api_key)
+        return True
 
     @property
     def sources_dir(self) -> Path:
@@ -85,11 +108,12 @@ class Settings:
         return self.data_dir / "clips"
 
     @property
-    def uploads_dir(self) -> Path:
-        return self.data_dir / "uploads"
+    def models_dir(self) -> Path:
+        """Whisper weights. On the data volume so a rebuild does not refetch."""
+        return self.data_dir / "models"
 
     def ensure_dirs(self) -> None:
-        for directory in (self.sources_dir, self.clips_dir, self.uploads_dir):
+        for directory in (self.sources_dir, self.clips_dir, self.models_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
     def validate(self) -> list[str]:
@@ -101,6 +125,12 @@ class Settings:
             problems.append("SECRET_KEY is shorter than 32 characters")
         if not self.admin_emails:
             problems.append("ADMIN_EMAILS is empty; nobody would be able to log in")
+        if self.transcription_provider not in {"faster-whisper", "disabled"}:
+            problems.append(f"TRANSCRIPTION_PROVIDER={self.transcription_provider!r} is not one of faster-whisper, disabled")
+        if self.suggest_provider not in {"ollama", "anthropic", "disabled"}:
+            problems.append(f"SUGGEST_PROVIDER={self.suggest_provider!r} is not one of ollama, anthropic, disabled")
+        if self.suggest_provider == "anthropic" and not self.anthropic_api_key:
+            problems.append("SUGGEST_PROVIDER=anthropic but ANTHROPIC_API_KEY is empty")
         return problems
 
 

@@ -105,3 +105,88 @@ def extract_frame(source, destination, at: float | None = None):
     command += ["-i", str(source), "-frames:v", "1", str(destination)]
     subprocess.run(command, check=True, capture_output=True)
     return destination
+
+
+# ------------------------------------------------------------ providers ----
+# The suite must never load Whisper weights or call a language model. These
+# fakes stand in for both, and the DB-backed tests inject them.
+
+from app.suggest import SuggestedClip, SuggestionProvider, SuggestionResponse  # noqa: E402
+from app.transcription import TranscriptSegment, TranscriptionProvider, Word  # noqa: E402
+
+
+class FakeTranscription(TranscriptionProvider):
+    """Returns a fixed transcript: one 5-second segment every 5 seconds."""
+
+    name = "fake"
+    enabled = True
+
+    def __init__(self, duration: float = 30.0, step: float = 5.0):
+        self.duration, self.step = duration, step
+        self.calls = 0
+
+    def transcribe(self, audio_path):
+        self.calls += 1
+        segments = []
+        t = 0.0
+        while t < self.duration:
+            end = min(t + self.step, self.duration)
+            words = [Word(t, t + 1.0, "alpha"), Word(t + 1.0, t + 2.0, "beta"), Word(t + 2.0, end, "gamma")]
+            segments.append(TranscriptSegment(len(segments), t, end, f"segment {len(segments)} alpha beta gamma", words))
+            t = end
+        return segments, "en"
+
+
+class FakeSuggestions(SuggestionProvider):
+    """Proposes fixed segment ranges, or raises, as the test dictates."""
+
+    name = "fake"
+
+    def __init__(self, clips=None, fail: str | None = None):
+        self.clips = clips if clips is not None else [
+            SuggestedClip(start_segment=1, end_segment=2, title="Founder origin story", reason="hook"),
+            SuggestedClip(start_segment=4, end_segment=4, title="Closing line", reason="resolves"),
+        ]
+        self.fail = fail
+        self.calls = 0
+
+    def propose(self, transcript, target_count, segment_count):
+        from app.suggest import SuggestionError
+
+        self.calls += 1
+        if self.fail:
+            raise SuggestionError(self.fail)
+        return SuggestionResponse(clips=self.clips)
+
+
+@pytest.fixture
+def fake_providers():
+    """Install fake transcription + suggestion providers for one test."""
+    from app import suggest, transcription
+
+    t, s = FakeTranscription(), FakeSuggestions()
+    transcription.set_provider(t)
+    suggest.set_provider(s)
+    try:
+        yield t, s
+    finally:
+        transcription.set_provider(None)
+        suggest.set_provider(None)
+
+
+@pytest.fixture(scope="module")
+def database():
+    """A clean schema in the test database. Skips without TEST_DATABASE_URL."""
+    import os
+
+    if not os.getenv("TEST_DATABASE_URL"):
+        pytest.skip("TEST_DATABASE_URL not set")
+    from app import db
+
+    db.wait_for_database()
+    with db.connection() as conn:
+        conn.execute(
+            "DROP TABLE IF EXISTS transcript_segments, clips, jobs, login_tokens, invites, users CASCADE"
+        )
+    db.apply_schema()
+    yield db

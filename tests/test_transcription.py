@@ -1,35 +1,24 @@
 """Tests for the transcription layer.
 
-faster-whisper is not required to run these: the interface is what is under
-test, plus the audio extraction command, which is pure ffmpeg.
+faster-whisper is not required: the interface, the disabled short-circuit and
+the ffmpeg audio extraction are what is under test.
 """
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from app import transcription
 from app.media import extract_audio, probe
 from app.transcription import (
     NullTranscriptionProvider,
     TranscriptionError,
-    TranscriptionProvider,
     TranscriptSegment,
     Word,
     get_provider,
     set_provider,
 )
-from tests.conftest import requires_ffmpeg
-
-
-class FakeProvider(TranscriptionProvider):
-    name = "fake"
-
-    def __init__(self, segments=None):
-        self.segments = segments or []
-        self.calls = 0
-
-    def transcribe(self, audio_path):
-        self.calls += 1
-        return self.segments, "en"
+from tests.conftest import FakeTranscription, requires_ffmpeg
 
 
 class TestSegmentModel:
@@ -50,12 +39,24 @@ class TestSegmentModel:
 
 class TestProviderSelection:
     def test_provider_is_swappable(self):
-        fake = FakeProvider()
+        fake = FakeTranscription()
         set_provider(fake)
         try:
             assert get_provider() is fake
         finally:
             set_provider(None)
+
+    def test_suite_default_is_the_disabled_provider(self):
+        # run-tests.sh sets TRANSCRIPTION_PROVIDER=disabled so no test can
+        # accidentally download Whisper weights.
+        set_provider(None)
+        provider = get_provider()
+        set_provider(None)
+        assert isinstance(provider, NullTranscriptionProvider)
+
+    def test_disabled_provider_is_flagged_so_the_pipeline_skips_audio_extraction(self):
+        assert NullTranscriptionProvider.enabled is False
+        assert FakeTranscription.enabled is True
 
     def test_null_provider_refuses_clearly(self):
         with pytest.raises(TranscriptionError, match="disabled"):
@@ -63,7 +64,9 @@ class TestProviderSelection:
 
     def test_unknown_provider_name_is_rejected_with_the_valid_options(self, monkeypatch):
         set_provider(None)
-        monkeypatch.setenv("TRANSCRIPTION_PROVIDER", "not-a-real-provider")
+        monkeypatch.setattr(
+            transcription, "settings", SimpleNamespace(transcription_provider="nope")
+        )
         try:
             with pytest.raises(TranscriptionError, match="unknown transcription provider"):
                 get_provider()
@@ -74,11 +77,9 @@ class TestProviderSelection:
 @requires_ffmpeg
 class TestAudioExtraction:
     def test_produces_16k_mono_pcm(self, marked_source, tmp_path):
-        audio = extract_audio(marked_source, tmp_path / "audio.wav")
-        assert audio.exists()
-
         import subprocess
 
+        audio = extract_audio(marked_source, tmp_path / "audio.wav")
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "a:0",
              "-show_entries", "stream=codec_name,sample_rate,channels",
@@ -90,9 +91,9 @@ class TestAudioExtraction:
         assert "channels=1" in result.stdout, "Whisper expects mono"
 
     def test_output_has_no_video_stream(self, marked_source, tmp_path):
-        audio = extract_audio(marked_source, tmp_path / "audio.wav")
         from app.media import MediaError
 
+        audio = extract_audio(marked_source, tmp_path / "audio.wav")
         with pytest.raises(MediaError, match="no video stream"):
             probe(audio)
 

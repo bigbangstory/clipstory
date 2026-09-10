@@ -91,3 +91,9 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS transcript_language TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS transcript_error TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS suggestions JSONB;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS suggestion_error TEXT;
+
+-- Review-and-tweak flow. resume_status remembers where a job returns to after
+-- a requested suggestion re-run; finalised_at marks the job locked and its
+-- source deleted.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS resume_status TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS finalised_at TIMESTAMPTZ;

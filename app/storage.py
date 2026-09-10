@@ -12,7 +12,7 @@ import logging
 import shutil
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import BinaryIO, Iterator
+from typing import BinaryIO
 
 log = logging.getLogger(__name__)
 
@@ -31,9 +31,6 @@ class Storage(ABC):
     def open_write(self, key: str, *, append: bool = False) -> BinaryIO: ...
 
     @abstractmethod
-    def open_read(self, key: str) -> BinaryIO: ...
-
-    @abstractmethod
     def size(self, key: str) -> int: ...
 
     @abstractmethod
@@ -46,8 +43,6 @@ class Storage(ABC):
     @abstractmethod
     def move(self, source_key: str, destination_key: str) -> None: ...
 
-    @abstractmethod
-    def iter_chunks(self, key: str, chunk_bytes: int = 1024 * 1024) -> Iterator[bytes]: ...
 
 
 class LocalDiskStorage(Storage):
@@ -71,9 +66,6 @@ class LocalDiskStorage(Storage):
         path.parent.mkdir(parents=True, exist_ok=True)
         return path.open("ab" if append else "wb")
 
-    def open_read(self, key: str) -> BinaryIO:
-        return self.path_for(key).open("rb")
-
     def size(self, key: str) -> int:
         path = self.path_for(key)
         return path.stat().st_size if path.exists() else 0
@@ -95,11 +87,6 @@ class LocalDiskStorage(Storage):
         destination = self.path_for(destination_key)
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(self.path_for(source_key)), str(destination))
-
-    def iter_chunks(self, key: str, chunk_bytes: int = 1024 * 1024) -> Iterator[bytes]:
-        with self.open_read(key) as handle:
-            while chunk := handle.read(chunk_bytes):
-                yield chunk
 
     def free_bytes(self) -> int:
         return shutil.disk_usage(self.root).free

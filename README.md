@@ -1,102 +1,98 @@
 # Clipstory
 
-Upload one long video, paste a list of timestamps, get back multiple clips cut
-at exactly those points, named in sequence, downloadable as a zip.
+Upload one long video. It gets transcribed, an AI picks the moments worth
+cutting, the clips are cut on the exact frame and named in order, and you
+download a zip. If a pick is slightly off, nudge it and only that clip is
+re-rendered.
 
-Hosted and invite-only. Nothing to install on anyone's machine.
+Hosted and invite-only. Nothing to install on anyone's machine. Everything,
+including the transcription and the AI, runs on your own server at no
+per-video cost.
 
-## Why it exists
+## What happens to a video
 
-Cutting a podcast or webinar into social clips means either paying per video
-for a tool that guesses where the interesting bits are, or doing it by hand in
-an editor. Clipstory does neither. You decide the moments; it does the cutting,
-exactly, in bulk.
+```
+UPLOAD -> TRANSCRIBE -> AI PICKS CLIPS -> CUT ALL PICKS -> REVIEW & TWEAK -> RE-CUT CHANGED -> DOWNLOAD
+          Whisper       local LLM         ffmpeg, exact    play, nudge,       only the ones     clip_01..N
+          on the VM     on the VM         frame            drag, add, delete  you touched       + zip
+```
 
-## The one guarantee
+Nothing waits on a human. You open the page to a set of finished, playable
+clips. You only touch the ones you want to change.
 
-**Every clip starts on the frame you asked for.**
+## The two guarantees
 
-The fast way to cut video is `ffmpeg -c copy`, which does not re-encode. It can
-only start a file on a keyframe, so it silently moves your cut by up to the
-keyframe interval, commonly 2 to 10 seconds. It never warns you.
-
-Clipstory re-encodes instead, and then checks its own work: every rendered clip
-is probed and rejected if its duration drifts more than one frame from the
-request. A clip you receive is a clip that was verified.
-
-Measured on a source with keyframes every 10 seconds, asked to cut at 17.400s:
+**1. Every clip starts on the frame you asked for.** The fast way to cut video
+(`ffmpeg -c copy`) can only start on a keyframe, so it silently moves a cut by
+up to the keyframe interval, commonly 2 to 10 seconds. Clipstory re-encodes
+and then checks its own work: every rendered clip is probed and rejected if it
+drifts more than one frame from the request. Measured on a source with
+keyframes every 10 seconds, asked to cut at 17.400s:
 
 | | first frame | duration for a 5.000s request |
 |---|---|---|
 | Clipstory | frame 435, at 17.400s | 5.000s, 125 frames |
 | `-c copy` | frame 250, at 10.000s | 12.480s, 312 frames |
 
-See `tests/test_media.py`, which fails if this ever regresses.
+**2. The AI can never invent a timestamp.** It reads the transcript as
+numbered segments and answers with segment numbers. The seconds come from
+Whisper's measured word timings. A number that does not exist fails a lookup
+and is dropped. A model's worst case is a dull pick, never a wrong cut.
 
-## How it works
+Both are enforced by tests that fail if anyone regresses them.
 
-1. Sign in with a magic link. Invite-only: an address not on the list cannot
-   get in, whoever sends them the URL.
-2. Upload a long video. It goes up in chunks, so a dropped connection resumes
-   instead of starting over.
-3. Paste your cut points, one per line.
-4. Check the table of what was understood. Nothing renders until you confirm.
-5. Download the clips individually or as one zip, with a manifest.
+## Reviewing the picks
 
-### Timestamp formats
+One page per video: the clips on the left, the source player with a timeline
+and the searchable transcript on the right.
+
+- **Play** any rendered clip, or audition a proposed range in the source.
+- **Nudge** a clip's start or end by one second, or to the previous or next
+  word boundary from the transcript.
+- **Drag** a clip's edges on the timeline; they snap to the nearest word.
+- **Add** a clip from the player (set start, set end), by shift-clicking a
+  transcript line and clicking another, or as a line of text.
+- **Delete** any clip.
+- **Apply changes** re-renders only what changed.
+- **Finalise** renumbers the clips 01 to N, deletes the source, and locks the
+  job.
+
+The text box accepts `HH:MM:SS.mmm - HH:MM:SS.mmm | label`, `MM:SS`, or plain
+seconds, with `-`, `->`, `to` or a comma between start and end. A line that
+matches an existing clip leaves it untouched.
+
+## Output
 
 ```
-00:04:17 - 00:05:22
-00:04:17.500 -> 00:05:22.250
-04:17 to 05:22
-257, 322
-00:12:03 - 00:13:40 | Founder origin story
-# lines starting with a hash are ignored
-```
-
-A line that will not parse blocks the whole job and is quoted back at you with
-its line number. Partial rendering would be worse than no rendering.
-
-### Output
-
-```
-podcast-ep12_clip_01_founder-origin-story.mp4
-podcast-ep12_clip_02.mp4
-podcast-ep12_clip_03_closing-line.mp4
+podcast-ep12_clip_01_your-first-ten-clients.mp4
+podcast-ep12_clip_02_the-fiverr-objection.mp4
+podcast-ep12_clip_03_one-piece-of-advice.mp4
 manifest.json
 ```
 
-Numbered in the order you pasted them, zero-padded so they sort correctly.
+## Stack, all on one machine
 
-## Retention
-
-The source video is deleted as soon as its clips render, because it is the
-expensive object and is rarely needed twice. If a job fails, the source is kept
-so you can retry without re-uploading. Clips are deleted after 30 days.
-Both are configurable.
-
-## Architecture
-
-Two processes and a database, all on one machine.
-
-| Piece | What it does |
+| Layer | Tool |
 |---|---|
-| `app/web.py` | HTTP. Never blocks: the longest thing a request does is write one 8 MB chunk. |
-| `app/worker.py` | Probing and rendering. Claims jobs with `FOR UPDATE SKIP LOCKED`. |
-| Postgres | State and the queue. A restart resumes rather than losing work. |
-| `app/storage.py` | Files behind an interface, so local disk can become S3 or R2 without a rewrite. |
+| Web | FastAPI, plain HTML, one small script for the review page |
+| State and queue | Postgres, claimed with `FOR UPDATE SKIP LOCKED` |
+| Worker | One Python process: probe, transcribe, suggest, render |
+| Reading and cutting | ffprobe, ffmpeg (libx264, CRF 18) |
+| Transcription | faster-whisper, Whisper `base`, word timestamps, VAD |
+| Clip picking | Ollama running `qwen2.5:7b-instruct`, JSON-schema constrained |
+| Public URL | Cloudflare Tunnel, no inbound ports |
 
-Key modules: `timestamps.py` (parsing and validation), `media.py` (ffmpeg and
-the accuracy check), `naming.py` (output filenames), `auth.py` (invite-only
-magic links), `jobs.py` (lifecycle and retention).
+Both model providers sit behind an interface: `TRANSCRIPTION_PROVIDER` and
+`SUGGEST_PROVIDER` in `.env`. Hosted Claude (`anthropic`) is available as a
+paid swap for the clip picker.
 
 ## Deploying
 
-See [docs/DEPLOY.md](docs/DEPLOY.md) for a free Oracle Cloud install with a
-Cloudflare Tunnel. Short version:
+See [docs/DEPLOY.md](docs/DEPLOY.md) for a zero-cost install on an Oracle
+Cloud Always Free VM. Short version:
 
 ```bash
-cp .env.example .env      # set SECRET_KEY, POSTGRES_PASSWORD, ADMIN_EMAILS, BASE_URL
+cp .env.example .env      # SECRET_KEY, POSTGRES_PASSWORD, ADMIN_EMAILS, BASE_URL
 docker compose up -d --build
 docker compose logs web | grep "SIGN-IN LINK"
 ```
@@ -108,17 +104,17 @@ docker compose up -d db
 DATABASE_URL=postgresql://clipstory:$PASSWORD@localhost:5432/clipstory ./run-tests.sh
 ```
 
-124 tests. The media and integration tests need `ffmpeg` and `ffprobe` on the
-path and skip cleanly without them; the integration tests need
-`TEST_DATABASE_URL` and skip without it.
+169 tests. The runner disables both model providers so nothing downloads
+weights or calls a model; tests that need a transcript or suggestions inject
+fakes. Media and integration tests need `ffmpeg` and skip cleanly without it;
+integration tests need `TEST_DATABASE_URL`.
 
-The suite generates real video, cuts it, and verifies the output frame by
-frame, including once through the entire upload-to-download pipeline.
+The suite generates real video, cuts it, and checks the output frame by frame,
+including once through the entire upload, review, tweak, finalise, download
+path.
 
 ## Documents
 
-- [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) - the agreed spec and why each
-  decision was made
-- [docs/FREE-TIER-OPTIONS.md](docs/FREE-TIER-OPTIONS.md) - which free hosts can
-  actually run this, verified against vendor docs
-- [docs/DEPLOY.md](docs/DEPLOY.md) - deployment
+- [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md): what was agreed and why
+- [docs/DEPLOY.md](docs/DEPLOY.md): deployment and first-run measurement
+- [docs/FREE-TIER-OPTIONS.md](docs/FREE-TIER-OPTIONS.md): which free hosts can run this

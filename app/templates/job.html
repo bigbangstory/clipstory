@@ -10,394 +10,195 @@
       {% if job.duration_seconds %}<span>Duration <b>{{ job.duration_seconds | timestamp }}</b></span>{% endif %}
       {% if job.width %}<span>Resolution <b>{{ job.width }}x{{ job.height }}</b></span>{% endif %}
       {% if job.fps %}<span>Frame rate <b>{{ '%.3f'|format(job.fps) }} fps</b></span>{% endif %}
+      {% if job.transcript_language %}<span>Language <b>{{ job.transcript_language }}</b></span>{% endif %}
       <span>Size <b>{{ job.source_bytes | human_bytes }}</b></span>
     </div>
   </div>
+  {% if clips and (job.status in ('complete','finalised','failed')) %}
+  <div class="row">
+    <a class="btn" href="/jobs/{{ job.id }}/download.zip">Download all as zip</a>
+    <a class="btn secondary" href="/jobs/{{ job.id }}/manifest.json">manifest.json</a>
+  </div>
+  {% endif %}
 </div>
 
 {% if job.variable_frame_rate %}
-<div class="note warn">
-  This source has a <b>variable frame rate</b>. Cuts are still frame-accurate
-  because every clip is re-encoded to a constant rate, but the reported
-  duration of a clip may differ from the request by a frame.
-</div>
+<div class="note warn">This source has a <b>variable frame rate</b>. Cuts are still
+  frame-accurate because every clip is re-encoded to a constant rate, but a clip's
+  reported duration may differ from the request by one frame.</div>
+{% endif %}
+{% if job.error %}<div class="note bad"><b>Error.</b> {{ job.error }}</div>{% endif %}
+{% if parse_error %}
+  <div class="note bad">
+    <b>{% if error_line_number %}Line {{ error_line_number }}{% else %}Could not read the cut list{% endif %}.</b>
+    {{ parse_error }}
+    {% if error_line %}<div class="mono" style="margin-top:8px;opacity:.85">{{ error_line }}</div>{% endif %}
+    <div style="margin-top:8px">Nothing was changed. Fix the line and submit again.</div>
+  </div>
 {% endif %}
 
-{% if job.error %}<div class="note bad"><b>Error.</b> {{ job.error }}</div>{% endif %}
-
-{# ---------------------------------------------------------- in progress #}
-{% if job.status in ('uploading','uploaded','probing') %}
+{# ------------------------------------------------------------- in flight #}
+{% set in_flight = job.status in ('uploading','uploaded','probing','transcribing','queued','rendering','suggest_requested','suggesting') %}
+{% if in_flight %}
   <div class="panel">
-    <b>Reading the video</b>
-    <p class="muted" style="margin:6px 0 0">
-      Checking duration, resolution and frame rate. This is quick; the page
-      refreshes itself when it is done.
-    </p>
+    {% if job.status in ('uploading','uploaded','probing') %}
+      <b>Reading the video</b>
+      <p class="muted" style="margin:6px 0 0">Duration, resolution and frame rate. Quick.</p>
+    {% elif job.status == 'transcribing' %}
+      <b>Transcribing, then picking clips</b>
+      <p class="muted" style="margin:6px 0 0">
+        Turning the audio into text with exact timings, then the AI reads it and
+        chooses the moments worth cutting. Expect roughly the length of the video,
+        then a few minutes more. Your clips render automatically after that; you
+        can close this page.
+      </p>
+    {% elif job.status in ('suggest_requested','suggesting') %}
+      <b>Asking the AI again</b>
+      <p class="muted" style="margin:6px 0 0">Your existing clips are untouched. New suggestions appear below when it is done.</p>
+    {% else %}
+      <div class="spread"><b>Rendering clips</b><span id="count" class="mono">0 / {{ clips|length }}</span></div>
+      <div class="progress"><div id="bar"></div></div>
+      <p class="muted" style="margin:8px 0 0;font-size:13px">
+        Each clip is re-encoded so it starts on the exact frame, then checked
+        against the request before it is kept. Only clips that changed are rendered.
+      </p>
+    {% endif %}
   </div>
+{% endif %}
 
-{% elif job.status == 'transcribing' %}
-  <div class="panel">
-    <b>Transcribing</b>
-    <p class="muted" style="margin:6px 0 0">
-      Turning the audio into text with timestamps, so you can read the video
-      instead of scrubbing it. Expect roughly the length of the video.
-      {% if suggestions_enabled %}Clip suggestions follow.{% endif %}
-      You can close this page; it keeps going.
-    </p>
-  </div>
+{# ----------------------------------------------------------------- review #}
+{% if not in_flight or clips %}
 
-{# ------------------------------------------------------- awaiting cuts #}
-{% elif job.status == 'awaiting_cuts' or preview %}
-
-  {% if parse_error %}
-    <div class="note bad">
-      <b>{% if error_line_number %}Line {{ error_line_number }}{% else %}Could not read the cut list{% endif %}.</b>
-      {{ parse_error }}
-      {% if error_line %}<div class="mono" style="margin-top:8px;opacity:.85">{{ error_line }}</div>{% endif %}
-      <div style="margin-top:8px">Nothing was rendered. Fix the line and submit again.</div>
-    </div>
+  {% if job.transcript_error and not in_flight %}
+    <div class="note warn"><b>No transcript.</b> {{ job.transcript_error }}
+      The AI cannot suggest clips without one; add clips from the player or the text box.</div>
+  {% endif %}
+  {% if job.suggestion_error and not job.transcript_error and not in_flight %}
+    <div class="note"><b>No AI suggestions.</b> {{ job.suggestion_error }}</div>
+  {% endif %}
+  {% if job.status == 'finalised' %}
+    <div class="note good"><b>Finalised.</b> Clips are numbered {{ '%02d'|format(1) }} to
+      {{ '%02d'|format(clips|length) }} and the source video has been removed.
+      Files are kept until {{ job.expires_at.strftime('%d %B %Y') if job.expires_at else 'the retention date' }}.</div>
   {% endif %}
 
-  {% if preview %}
-    <h2>Confirm these {{ preview|length }} clip{{ 's' if preview|length != 1 }}</h2>
-    <p class="sub">This is exactly what will be cut. Check it before rendering.</p>
+  <script id="reviewData" type="application/json">{{ review_data | tojson }}</script>
 
-    {% if overlaps %}
-      <div class="note warn">
-        <b>{{ overlaps|length }} overlapping range{{ 's' if overlaps|length != 1 }}.</b>
-        That is allowed, the same moment can appear in two clips. Flagging it in
-        case it was not deliberate.
-      </div>
-    {% endif %}
-
-    <div class="panel" style="padding:20px 10px">
-      <table>
-        <thead><tr>
-          <th style="padding-left:20px">#</th><th>Start</th><th>End</th>
-          <th>Length</th><th class="hide-sm">Label</th><th class="hide-sm">Filename</th>
-        </tr></thead>
-        <tbody>
-        {% for cut, filename in preview %}
-          <tr>
-            <td style="padding-left:20px" class="mono">{{ '%02d'|format(cut.sequence) }}</td>
-            <td class="mono">{{ cut.start | timestamp }}</td>
-            <td class="mono">{{ cut.end | timestamp }}</td>
-            <td class="mono">{{ '%.3f'|format(cut.duration) }}s</td>
-            <td class="hide-sm">{{ cut.label or '' }}</td>
-            <td class="hide-sm mono muted" style="font-size:12px">{{ filename }}</td>
-          </tr>
-        {% endfor %}
-        </tbody>
-      </table>
-    </div>
-
-    <form method="post" action="/jobs/{{ job.id }}/cuts" class="row">
-      <input type="hidden" name="cuts" value="{{ cuts_text }}">
-      <input type="hidden" name="confirm" value="yes">
-      <button class="btn">Render {{ preview|length }} clip{{ 's' if preview|length != 1 }}</button>
-      <a class="btn secondary" href="/jobs/{{ job.id }}">Edit the list</a>
-    </form>
-
-  {% else %}
-
-    {% if job.transcript_error %}
-      <div class="note warn">
-        <b>No transcript.</b> {{ job.transcript_error }}
-        You can still paste timestamps by hand below.
-      </div>
-    {% endif %}
-
-    {% if suggestions %}
-      <div class="spread" style="margin-top:24px">
-        <h2 style="margin:0">Suggested clips</h2>
-        <form method="post" action="/jobs/{{ job.id }}/suggest" style="margin:0">
-          <button class="btn secondary" style="padding:6px 12px;font-size:13px">Suggest again</button>
-        </form>
-      </div>
-      <p class="sub" style="margin:6px 0 12px">
-        Proposals only. Tick the ones you want, then edit freely before rendering.
-        Timestamps come from the transcript, not from the model.
-      </p>
-      <div class="panel" style="padding:8px 0">
-        {% for s in suggestions %}
-          <label class="suggestion">
-            <input type="checkbox" class="sugg" checked
-                   data-start="{{ '%.3f'|format(s.start) }}"
-                   data-end="{{ '%.3f'|format(s.end) }}"
-                   data-title="{{ s.title }}">
-            <span>
-              <b>{{ s.title }}</b>
-              <span class="mono muted" style="font-size:12px;margin-left:8px">
-                {{ s.start | timestamp }} &rarr; {{ s.end | timestamp }}
-                ({{ '%.0f'|format(s.end - s.start) }}s)
-              </span>
-              <div class="muted" style="font-size:13px;margin-top:2px">{{ s.reason }}</div>
-            </span>
-          </label>
-        {% endfor %}
-        <div style="padding:12px 18px 6px">
-          <button type="button" class="btn" id="useSuggestions">Use ticked suggestions</button>
-        </div>
-      </div>
-    {% elif job.suggestion_error %}
-      <div class="note">
-        <b>No clip suggestions.</b> {{ job.suggestion_error }}
-      </div>
-    {% endif %}
-
-    <h2>Cut points</h2>
-    <div class="split">
-      <div>
-        <div class="panel" style="margin-bottom:12px">
-          <form method="post" action="/jobs/{{ job.id }}/cuts">
-            <label for="cuts">One clip per line</label>
-            <textarea id="cuts" name="cuts" rows="12" required
-              placeholder="00:04:17 - 00:05:22&#10;00:12:03 - 00:13:40 | Founder origin story">{{ cuts_text or '' }}</textarea>
-            <div class="row" style="margin-top:12px">
-              <button class="btn">Check the list</button>
-              <button type="button" class="btn secondary" id="markIn">Set start from player</button>
-              <button type="button" class="btn secondary" id="markOut">Set end from player</button>
-            </div>
-          </form>
-        </div>
-        <div class="note" style="font-size:13px">
-          <b>Formats.</b> <span class="mono">-</span>,
-          <span class="mono">-&gt;</span>, <span class="mono">to</span> or a comma
-          between start and end. <span class="mono">HH:MM:SS</span>,
-          <span class="mono">MM:SS</span>, <span class="mono">HH:MM:SS.mmm</span>
-          or plain seconds. <span class="mono">| label</span> names a clip.
-          <span class="mono">#</span> comments a line out.
-          {% if job.duration_seconds %}
-            Video runs to <span class="mono">{{ job.duration_seconds | timestamp }}</span>.
-          {% endif %}
-        </div>
-      </div>
-
-      <div>
-        {% if source_available %}
-          <video id="player" controls preload="metadata"
-                 src="/jobs/{{ job.id }}/source"></video>
+  <div class="split">
+    <div>
+      {% if source_available %}
+        <video id="player" controls preload="metadata" src="/jobs/{{ job.id }}/source"></video>
+        {% if job.duration_seconds %}
+          <div id="timeline" class="timeline" title="Click to seek. Drag a handle to move a clip edge; it snaps to the nearest word."></div>
         {% endif %}
-
-        {% if transcript %}
-          <div class="panel" style="padding:12px">
-            <input type="text" id="findText" placeholder="Search the transcript"
-                   style="margin-bottom:10px">
-            <div id="transcript" class="transcript">
-              {% for line in transcript %}
-                <p class="tline" data-start="{{ '%.3f'|format(line.start_seconds) }}"
-                   data-end="{{ '%.3f'|format(line.end_seconds) }}">
-                  <span class="tstamp mono">{{ line.start_seconds | timestamp }}</span>
-                  <span class="ttext">{{ line.text }}</span>
-                </p>
-              {% endfor %}
-            </div>
-            <p class="muted" style="font-size:12px;margin:10px 0 0">
-              Click a line to jump the player there. Shift-click to set it as a
-              clip start, then click another line to close the range.
-            </p>
+        {% if editable %}
+          <div class="row" style="margin:8px 0 12px">
+            <button class="btn secondary" id="markIn">set start</button>
+            <button class="btn secondary" id="markOut" disabled>set end, add clip</button>
           </div>
         {% endif %}
-      </div>
-    </div>
+      {% endif %}
+      <video id="clipPlayer" controls hidden style="margin-top:8px"></video>
 
-    <div class="note">
-      <b>Accepted formats.</b> Separate start and end with
-      <span class="mono">-</span>, <span class="mono">-&gt;</span>,
-      <span class="mono">to</span> or a comma. Timestamps can be
-      <span class="mono">HH:MM:SS</span>, <span class="mono">MM:SS</span>,
-      <span class="mono">HH:MM:SS.mmm</span> or plain seconds. Add
-      <span class="mono">| a label</span> to name a clip. Lines starting with
-      <span class="mono">#</span> are ignored.
-      {% if job.duration_seconds %}
-        This video runs to <span class="mono">{{ job.duration_seconds | timestamp }}</span>.
+      {% if transcript %}
+        <div class="panel" style="padding:12px">
+          <input type="text" id="findText" placeholder="Search the transcript" style="margin-bottom:10px">
+          <div class="transcript">
+            {% for line in transcript %}
+              <p class="tline" data-start="{{ '%.3f'|format(line.start_seconds) }}"
+                 data-end="{{ '%.3f'|format(line.end_seconds) }}">
+                <span class="tstamp mono">{{ line.start_seconds | timestamp }}</span>
+                <span class="ttext">{{ line.text }}</span>
+              </p>
+            {% endfor %}
+          </div>
+          <p class="muted" style="font-size:12px;margin:10px 0 0">
+            Click a line to jump there. Shift-click to start a clip, click another line to end it.
+          </p>
+        </div>
       {% endif %}
     </div>
-  {% endif %}
-
-{# ------------------------------------------------------------ rendering #}
-{% elif job.status in ('queued','rendering') %}
-  <div class="panel">
-    <div class="spread"><b>Rendering clips</b><span id="count" class="mono">0 / {{ clips|length }}</span></div>
-    <div class="progress"><div id="bar"></div></div>
-    <p class="muted" style="margin:8px 0 0;font-size:13px">
-      Each clip is re-encoded so it starts on the exact frame you asked for,
-      then checked against the request before it is kept. Clips appear here as
-      they finish.
-    </p>
   </div>
-{% endif %}
 
-{# ---------------------------------------------------------------- clips #}
-{% if clips and job.status in ('queued','rendering','complete','failed') %}
-  <div class="spread" style="margin-top:26px">
-    <h2 style="margin:0">Clips</h2>
-    {% if job.status == 'complete' or (clips | selectattr('status','equalto','complete') | list) %}
-      <div class="row">
-        <a class="btn" href="/jobs/{{ job.id }}/download.zip">Download all as zip</a>
-        <a class="btn secondary" href="/jobs/{{ job.id }}/manifest.json">manifest.json</a>
+  <div class="clips-section">
+      <div class="spread" style="margin-bottom:8px">
+        <h2 style="margin:0">Clips</h2>
+        {% if editable and transcript %}
+          <form method="post" action="/jobs/{{ job.id }}/suggest" style="margin:0">
+            <button class="btn secondary" style="padding:6px 12px;font-size:13px">Ask the AI again</button>
+          </form>
+        {% endif %}
       </div>
-    {% endif %}
+
+      <div class="panel" style="padding:8px 0">
+        <table class="clips">
+          <thead><tr>
+            <th style="padding-left:16px">#</th><th>Title</th><th>Start</th><th>End</th>
+            <th>Len</th><th>Status</th><th></th>
+          </tr></thead>
+          <tbody id="clipRows"></tbody>
+        </table>
+        {% if not clips %}
+          <p class="muted" style="padding:14px 18px 8px">
+            No clips yet. Add one from the player, the transcript, or the text box.
+          </p>
+        {% endif %}
+      </div>
+
+      {% if editable %}
+        <div class="row" style="margin:12px 0">
+          <button class="btn" id="applyBtn" disabled>Apply changes</button>
+          <span id="dirtyNote" class="muted" style="font-size:13px" hidden>
+            Unsaved. Only clips you changed will be re-rendered.
+          </span>
+          {% if job.status == 'complete' and clips %}
+            <form method="post" action="/jobs/{{ job.id }}/finalise" style="margin-left:auto"
+                  onsubmit="return confirm('Finalise? Clips are renumbered 01 to N and the source video is deleted. No more edits after this.')">
+              <button class="btn secondary">Finalise and lock</button>
+            </form>
+          {% endif %}
+        </div>
+
+        <details class="panel" style="padding:12px 20px">
+          <summary class="muted" style="cursor:pointer">Edit as text</summary>
+          <form method="post" action="/jobs/{{ job.id }}/cuts" style="margin-top:10px">
+            <textarea id="cuts" name="cuts" rows="8">{{ cuts_text or '' }}</textarea>
+            <div class="row" style="margin-top:10px">
+              <button class="btn secondary">Save text</button>
+              <span class="muted" style="font-size:12px">
+                One clip per line: <span class="mono">HH:MM:SS.mmm - HH:MM:SS.mmm | label</span>.
+                Lines that match an existing clip leave it untouched.
+              </span>
+            </div>
+          </form>
+        </details>
+      {% endif %}
+
+      {% if job.expires_at and job.status != 'finalised' %}
+        <p class="muted" style="font-size:13px">
+          Clips are deleted on {{ job.expires_at.strftime('%d %B %Y') }},
+          {{ retention_days }} days after rendering. The source video stays until you finalise.
+        </p>
+      {% endif %}
   </div>
 
-  <div class="panel" style="padding:20px 10px;margin-top:12px">
-    <table>
-      <thead><tr>
-        <th style="padding-left:20px">#</th><th>Filename</th>
-        <th class="hide-sm">Start</th><th class="hide-sm">Length</th>
-        <th>Status</th><th></th>
-      </tr></thead>
-      <tbody id="clipRows">
-      {% for clip in clips %}
-        <tr data-sequence="{{ clip.sequence }}">
-          <td style="padding-left:20px" class="mono">{{ '%02d'|format(clip.sequence) }}</td>
-          <td class="mono" style="font-size:12px">{{ clip.output_filename }}
-            {% if clip.error %}<div class="muted" style="color:var(--danger)">{{ clip.error }}</div>{% endif %}
-          </td>
-          <td class="hide-sm mono">{{ clip.start_seconds | timestamp }}</td>
-          <td class="hide-sm mono">
-            {{ '%.3f'|format(clip.end_seconds - clip.start_seconds) }}s
-            {% if clip.rendered_duration %}
-              <span class="muted" title="actually rendered">({{ '%.3f'|format(clip.rendered_duration) }}s)</span>
-            {% endif %}
-          </td>
-          <td><span class="badge {{ clip.status }}">{{ clip.status }}</span></td>
-          <td style="text-align:right;padding-right:20px">
-            {% if clip.status == 'complete' %}
-              <a href="/jobs/{{ job.id }}/clips/{{ clip.id }}">Download</a>
-            {% endif %}
-          </td>
-        </tr>
-      {% endfor %}
-      </tbody>
-    </table>
-  </div>
-
-  {% if job.expires_at %}
-    <p class="muted" style="font-size:13px">
-      These clips are deleted on {{ job.expires_at.strftime('%d %B %Y') }},
-      {{ retention_days }} days after rendering.
-      {% if job.source_deleted_at %}The source video has already been removed to save space.{% endif %}
-    </p>
-  {% endif %}
+  <script src="/static/review.js"></script>
 {% endif %}
 
-{% if job.status == 'failed' %}
-  <form method="post" action="/jobs/{{ job.id }}/cuts" style="margin-top:14px">
-    <input type="hidden" name="cuts" value="{{ cuts_text or '' }}">
-    <a class="btn secondary" href="/jobs/{{ job.id }}">Try a different cut list</a>
-  </form>
-{% endif %}
-
-{% if transcript or suggestions %}
+{% if in_flight %}
 <script>
-// Transcript workspace. Everything here only ever writes text into the cut box;
-// the box is still parsed, validated and confirmed exactly as if typed by hand.
-const box    = document.getElementById('cuts');
-const player = document.getElementById('player');
-const lines  = [...document.querySelectorAll('.tline')];
-
-const fmt = s => {
-  const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60);
-  const sec = (s % 60).toFixed(3).padStart(6, '0');
-  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${sec}`;
-};
-const appendLine = text => {
-  box.value = (box.value && !box.value.endsWith('\n') ? box.value + '\n' : box.value) + text + '\n';
-  box.scrollTop = box.scrollHeight;
-};
-
-// Click a line to seek. Shift-click opens a range; the next click closes it.
-let rangeStart = null;
-lines.forEach(line => {
-  line.onclick = event => {
-    const start = parseFloat(line.dataset.start);
-    if (event.shiftKey) {
-      lines.forEach(l => l.classList.remove('range-start'));
-      rangeStart = start;
-      line.classList.add('range-start');
-      return;
-    }
-    if (rangeStart !== null) {
-      const end = parseFloat(line.dataset.end);
-      if (end > rangeStart) appendLine(`${fmt(rangeStart)} - ${fmt(end)}`);
-      rangeStart = null;
-      lines.forEach(l => l.classList.remove('range-start'));
-      return;
-    }
-    if (player) { player.currentTime = start; player.play(); }
-  };
-});
-
-// Follow along while the video plays.
-if (player) {
-  player.ontimeupdate = () => {
-    const t = player.currentTime;
-    for (const line of lines) {
-      const on = t >= parseFloat(line.dataset.start) && t < parseFloat(line.dataset.end);
-      line.classList.toggle('playing', on);
-    }
-  };
-  const markIn  = document.getElementById('markIn');
-  const markOut = document.getElementById('markOut');
-  if (markIn)  markIn.onclick  = () => appendLine(`${fmt(player.currentTime)} - `);
-  if (markOut) markOut.onclick = () => {
-    box.value = box.value.replace(/\s*-\s*$/, ` - ${fmt(player.currentTime)}`);
-  };
-}
-
-// Search. Dims non-matching lines rather than hiding them, so position in the
-// video stays legible.
-const find = document.getElementById('findText');
-if (find) {
-  find.oninput = () => {
-    const q = find.value.trim().toLowerCase();
-    lines.forEach(line => {
-      const hit = q && line.querySelector('.ttext').textContent.toLowerCase().includes(q);
-      line.classList.toggle('hit', !!hit);
-      line.classList.toggle('dim', !!q && !hit);
-    });
-  };
-}
-
-// Ticked suggestions become editable text, never a direct render.
-const useBtn = document.getElementById('useSuggestions');
-if (useBtn) {
-  useBtn.onclick = () => {
-    const picked = [...document.querySelectorAll('.sugg:checked')];
-    if (!picked.length) return;
-    box.value = '# Suggested clips. Edit freely, then check the list.\n'
-      + picked.map(c => `${fmt(+c.dataset.start)} - ${fmt(+c.dataset.end)} | ${c.dataset.title}`).join('\n')
-      + '\n';
-    box.scrollIntoView({behavior: 'smooth', block: 'center'});
-    box.focus();
-  };
-}
-</script>
-{% endif %}
-
-{% if job.status in ('uploading','uploaded','probing','transcribing','queued','rendering') %}
-<script>
-// Poll rather than refresh, so the page does not jump while it is being read.
 const total = {{ clips|length }};
 let misses = 0;
 setInterval(async () => {
   try {
     const res = await fetch('/jobs/{{ job.id }}/status');
     if (!res.ok) return;
-    const data = await res.json();
-    misses = 0;
-
+    const data = await res.json(); misses = 0;
     const bar = document.getElementById('bar');
     if (bar && total) {
       bar.style.width = (data.clips_done / total * 100) + '%';
       document.getElementById('count').textContent = `${data.clips_done} / ${total}`;
     }
-    for (const clip of data.clips) {
-      const row = document.querySelector(`tr[data-sequence="${clip.sequence}"] .badge`);
-      if (row && row.textContent.trim() !== clip.status) location.reload();
-    }
-    // A status change means a different page layout entirely.
     if (data.status !== '{{ job.status }}') location.reload();
   } catch (e) { if (++misses > 10) location.reload(); }
 }, 2500);
