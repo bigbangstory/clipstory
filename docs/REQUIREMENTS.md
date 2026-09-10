@@ -1,7 +1,7 @@
 # Clipstory - Requirement Specification (v2, simplified)
 
-Status: draft for sign-off.
-Last updated: 2026-09-10
+Status: **agreed. All open questions closed. Phase 1 ready to build.**
+Last updated: 2026-09-10 (decisions locked)
 Supersedes v1. Change log at the bottom.
 
 ---
@@ -90,16 +90,21 @@ Each job delivers the MP4s, a `manifest.json` (clip number, filename, start,
 end, duration, label, probed duration), and `all_clips.zip` streamed on demand
 rather than stored twice.
 
-## 7. Access
+## 7. Access: invite-only
 
 Magic-link login, no passwords to manage.
 
-**Access is restricted to an allowlist, not open to anyone with the URL.** An
-open tool means anyone can upload gigabytes and burn hours of CPU on your bill,
-and you become the host of whatever they upload. The allowlist is either your
-email domain or a list of invited addresses. Adding a teammate takes seconds.
+**Invite-only.** An admin adds an email address to the allowlist; only addresses
+on that list can log in. Anyone else who reaches the URL sees a login page and
+gets nowhere. This covers teammates, freelancers and clients on any domain
+without opening the door to strangers.
 
-Every user sees only their own jobs. An admin flag can see all of them.
+Rejected: open access for anyone with the link. It would let strangers upload
+gigabytes and burn CPU on your bill, and make you the host of whatever they
+uploaded.
+
+Every user sees only their own jobs. An admin flag can see all of them, and
+manages the invite list from a simple settings page.
 
 ## 8. Architecture: two services
 
@@ -120,26 +125,37 @@ and a real filesystem. This is the one constraint that is not negotiable.
 instead of losing the work. The worker claims jobs with `SELECT ... FOR UPDATE
 SKIP LOCKED`. That is the whole queue.
 
-## 9. Verified plan requirements
+## 9. Sizing, against the agreed worst case
 
-Two hard gates, both checked against vendor docs on 2026-09-10:
+Agreed worst case: **1 hour at 1080p**, roughly 2 to 4 GB per source.
 
-**Supabase free tier caps uploads at 50 MB per file.** Fatal for long video. The
-Pro plan raises this to 500 GB. **Supabase Pro is required**, not optional.
+**Supabase Pro is required.** The free tier caps uploads at 50 MB per file,
+which a 2 GB source misses by a factor of forty. Pro raises the ceiling to
+500 GB. This is a hard gate, not a preference.
 (https://supabase.com/docs/guides/storage/uploads/file-limits)
 
-**Railway volumes are capped by plan**: Trial 500 MB, Hobby 5 GB, Pro up to 1 TB.
-The worker needs room for one source plus its clips at once. A 90-minute 1080p
-source is roughly 3.4 to 5.4 GB, so **Hobby's 5 GB is too tight and Pro is
-required**. (https://docs.railway.com/volumes/reference)
+**Railway Pro is recommended, Hobby is too tight.** Volume caps are Trial
+500 MB, Hobby 5 GB, Pro up to 1 TB. A 4 GB source on a 5 GB Hobby volume leaves
+under 1 GB for the rendered clips, and 10 minutes of 1080p output can fill that.
+Pro removes the constraint entirely. (https://docs.railway.com/volumes/reference)
 
-For contrast, Render caps `/tmp` at 2 GB on **every** instance type and evicts
-the service when exceeded, which rules Render out for this workload unless a
-persistent disk is attached.
+**Render is ruled out.** It caps `/tmp` at 2 GB on every instance type, paid
+included, and evicts the service when exceeded.
 (https://community.render.com/t/increase-2gb-tmp-limit/22587)
 
-Confirm current pricing on each vendor's own pricing page before committing.
-I have verified the limits above, not the prices.
+**Storage bill stays small** because of the retention rule in section 9a: the
+source, which is the expensive object, is deleted as soon as its clips render.
+Only the clips persist, and a job of 5 to 10 short clips is a few hundred MB.
+
+Vendor limits above are verified. Confirm current prices and included storage on
+each vendor's own pricing page before you subscribe; I have not verified those.
+
+## 9a. Retention
+
+- **Source video**: deleted immediately after its clips render successfully. If
+  the job fails, the source is kept so it can be retried without re-uploading.
+- **Clips and manifest**: kept 30 days, then auto-deleted.
+- A daily cleanup task enforces both. Users see the deletion date on the job.
 
 ## 10. Data model
 
@@ -155,13 +171,25 @@ clips          id, job_id, sequence, label, start_seconds, end_seconds,
 
 Status: `uploading -> probing -> awaiting_cuts -> rendering -> complete | failed`
 
-## 11. Still open
+## 11. Decisions locked
 
-1. **Your worst realistic source.** 1 hour at 1080p, or 3 hours at 4K? This sets
-   the volume size and the monthly bill. Everything else is decided.
-2. **Retention.** How long do sources and clips survive before auto-delete?
-   Storage on multi-GB files is the main recurring cost.
-3. **Team size and allowlist.** Which email domain, or which addresses?
+| Question | Decision |
+|---|---|
+| Worst realistic source | 1 hour, 1080p (roughly 2-4 GB) |
+| Retention | Source deleted after render; clips kept 30 days |
+| Who can log in | Invite-only list of email addresses |
+| Clips per job | Typically 5 to 10 |
+
+**Consequence of 5 to 10 clips per job: rendering runs sequentially.** At roughly
+15 to 40 seconds per 1080p clip, a typical job finishes in 2 to 7 minutes. That
+is well inside anyone's patience, so no parallel rendering is built. A
+concurrency setting is left in the config in case real timings prove otherwise.
+
+Nothing is blocking. Phase 1 can start.
+
+The only input still needed from you is operational, not architectural: the list
+of email addresses to seed the invite allowlist. That can be added after the
+first deploy.
 
 ## 12. Phases
 
@@ -186,4 +214,7 @@ is the actual product, is proven before any recurring API cost.
 - Render replaced by Railway, on a verified 2 GB `/tmp` cap.
 - Supabase Pro confirmed as a hard requirement, not a preference.
 - Manifest CSV dropped; JSON only.
-- Open questions cut from five to three.
+- Open questions cut from five to three, then all three answered and closed.
+- Worst case fixed at 1 hour 1080p; sequential rendering confirmed as sufficient.
+- Access settled as invite-only; open-link access explicitly rejected.
+- Retention settled: source deleted after render, clips kept 30 days.
