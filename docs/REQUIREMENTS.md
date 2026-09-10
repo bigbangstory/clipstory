@@ -38,15 +38,32 @@ seconds. That is the failure this tool exists to prevent.
 
 ```
 ffmpeg -ss <start> -i <source> -t <duration> \
+       -vf setpts=PTS-STARTPTS -af asetpts=PTS-STARTPTS \
        -c:v libx264 -crf 18 -preset veryfast -pix_fmt yuv420p \
        -c:a aac -b:a 192k \
-       -avoid_negative_ts make_zero -movflags +faststart \
+       -movflags +faststart \
        <output>
 ```
 
 `-ss` before `-i` seeks fast; with re-encode the output still begins on the
 exact frame. CRF 18 is visually transparent. `+faststart` makes clips stream
 instantly.
+
+**Correction to the v1 spec.** This command previously ended with
+`-avoid_negative_ts make_zero`, which is the widely recommended way to make a
+clip start at zero. Measurement during implementation showed it does the
+opposite here: it runs at the muxer, after filtering, and reinstates the very
+offset it is supposed to remove. With it, a 5.000s request produced a clip whose
+timeline started at 0.080s and whose container reported 5.022s. The
+`setpts`/`asetpts` filters replace it and produce 0.000s and 5.000s exactly,
+while also improving measured audio/video drift from 13.4ms to 5.3ms. A
+regression test now fails if the flag is reintroduced.
+
+**Verified on a real file.** A 30s source with keyframes forced every 10s was
+cut at 17.400s, which is 7.4s past the nearest keyframe. The output's first
+frame is the source's frame 435, exactly 17.400s, at 125 frames and 5.000s.
+The same cut with `-c copy` started on frame 250 at 10.000s, 7.4 seconds early,
+and returned 12.480s of video. See `tests/test_media.py`.
 
 After each render the worker probes the output and asserts the duration is
 within one frame of what was asked. A clip that fails is marked failed, never
