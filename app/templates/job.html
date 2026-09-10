@@ -1,0 +1,221 @@
+{% extends "base.html" %}
+{% block title %}{{ job.source_filename }} - Clipstory{% endblock %}
+{% block content %}
+
+<div class="spread">
+  <div>
+    <h1>{{ job.source_filename }}</h1>
+    <div class="stat">
+      <span><span class="badge {{ job.status }}">{{ job.status.replace('_',' ') }}</span></span>
+      {% if job.duration_seconds %}<span>Duration <b>{{ job.duration_seconds | timestamp }}</b></span>{% endif %}
+      {% if job.width %}<span>Resolution <b>{{ job.width }}x{{ job.height }}</b></span>{% endif %}
+      {% if job.fps %}<span>Frame rate <b>{{ '%.3f'|format(job.fps) }} fps</b></span>{% endif %}
+      <span>Size <b>{{ job.source_bytes | human_bytes }}</b></span>
+    </div>
+  </div>
+</div>
+
+{% if job.variable_frame_rate %}
+<div class="note warn">
+  This source has a <b>variable frame rate</b>. Cuts are still frame-accurate
+  because every clip is re-encoded to a constant rate, but the reported
+  duration of a clip may differ from the request by a frame.
+</div>
+{% endif %}
+
+{% if job.error %}<div class="note bad"><b>Error.</b> {{ job.error }}</div>{% endif %}
+
+{# ---------------------------------------------------------- in progress #}
+{% if job.status in ('uploading','uploaded','probing') %}
+  <div class="panel">
+    <b>Reading the video</b>
+    <p class="muted" style="margin:6px 0 0">
+      Checking duration, resolution and frame rate. This is quick; the page
+      refreshes itself when it is done.
+    </p>
+  </div>
+
+{# ------------------------------------------------------- awaiting cuts #}
+{% elif job.status == 'awaiting_cuts' or preview %}
+
+  {% if parse_error %}
+    <div class="note bad">
+      <b>{% if error_line_number %}Line {{ error_line_number }}{% else %}Could not read the cut list{% endif %}.</b>
+      {{ parse_error }}
+      {% if error_line %}<div class="mono" style="margin-top:8px;opacity:.85">{{ error_line }}</div>{% endif %}
+      <div style="margin-top:8px">Nothing was rendered. Fix the line and submit again.</div>
+    </div>
+  {% endif %}
+
+  {% if preview %}
+    <h2>Confirm these {{ preview|length }} clip{{ 's' if preview|length != 1 }}</h2>
+    <p class="sub">This is exactly what will be cut. Check it before rendering.</p>
+
+    {% if overlaps %}
+      <div class="note warn">
+        <b>{{ overlaps|length }} overlapping range{{ 's' if overlaps|length != 1 }}.</b>
+        That is allowed, the same moment can appear in two clips. Flagging it in
+        case it was not deliberate.
+      </div>
+    {% endif %}
+
+    <div class="panel" style="padding:20px 10px">
+      <table>
+        <thead><tr>
+          <th style="padding-left:20px">#</th><th>Start</th><th>End</th>
+          <th>Length</th><th class="hide-sm">Label</th><th class="hide-sm">Filename</th>
+        </tr></thead>
+        <tbody>
+        {% for cut in preview %}
+          <tr>
+            <td style="padding-left:20px" class="mono">{{ '%02d'|format(cut.sequence) }}</td>
+            <td class="mono">{{ cut.start | timestamp }}</td>
+            <td class="mono">{{ cut.end | timestamp }}</td>
+            <td class="mono">{{ '%.3f'|format(cut.duration) }}s</td>
+            <td class="hide-sm">{{ cut.label or '' }}</td>
+            <td class="hide-sm mono muted" style="font-size:12px">
+              {{ job.source_filename | replace('.mp4','') | lower | replace(' ','-') }}_clip_{{ '%02d'|format(cut.sequence) }}.mp4
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <form method="post" action="/jobs/{{ job.id }}/cuts" class="row">
+      <input type="hidden" name="cuts" value="{{ cuts_text }}">
+      <input type="hidden" name="confirm" value="yes">
+      <button class="btn">Render {{ preview|length }} clip{{ 's' if preview|length != 1 }}</button>
+      <a class="btn secondary" href="/jobs/{{ job.id }}">Edit the list</a>
+    </form>
+
+  {% else %}
+    <h2>Paste your cut points</h2>
+    <div class="panel">
+      <form method="post" action="/jobs/{{ job.id }}/cuts">
+        <label for="cuts">One clip per line</label>
+        <textarea id="cuts" name="cuts" rows="10" required autofocus
+          placeholder="00:04:17 - 00:05:22&#10;00:12:03 - 00:13:40 | Founder origin story">{{ cuts_text or '' }}</textarea>
+        <button class="btn" style="margin-top:14px">Check the list</button>
+        <span class="muted" style="margin-left:10px;font-size:13px">
+          You will see exactly what was understood before anything renders.
+        </span>
+      </form>
+    </div>
+
+    <div class="note">
+      <b>Accepted formats.</b> Separate start and end with
+      <span class="mono">-</span>, <span class="mono">-&gt;</span>,
+      <span class="mono">to</span> or a comma. Timestamps can be
+      <span class="mono">HH:MM:SS</span>, <span class="mono">MM:SS</span>,
+      <span class="mono">HH:MM:SS.mmm</span> or plain seconds. Add
+      <span class="mono">| a label</span> to name a clip. Lines starting with
+      <span class="mono">#</span> are ignored.
+      {% if job.duration_seconds %}
+        This video runs to <span class="mono">{{ job.duration_seconds | timestamp }}</span>.
+      {% endif %}
+    </div>
+  {% endif %}
+
+{# ------------------------------------------------------------ rendering #}
+{% elif job.status in ('queued','rendering') %}
+  <div class="panel">
+    <div class="spread"><b>Rendering clips</b><span id="count" class="mono">0 / {{ clips|length }}</span></div>
+    <div class="progress"><div id="bar"></div></div>
+    <p class="muted" style="margin:8px 0 0;font-size:13px">
+      Each clip is re-encoded so it starts on the exact frame you asked for,
+      then checked against the request before it is kept. Clips appear here as
+      they finish.
+    </p>
+  </div>
+{% endif %}
+
+{# ---------------------------------------------------------------- clips #}
+{% if clips and job.status in ('queued','rendering','complete','failed') %}
+  <div class="spread" style="margin-top:26px">
+    <h2 style="margin:0">Clips</h2>
+    {% if job.status == 'complete' or (clips | selectattr('status','equalto','complete') | list) %}
+      <div class="row">
+        <a class="btn" href="/jobs/{{ job.id }}/download.zip">Download all as zip</a>
+        <a class="btn secondary" href="/jobs/{{ job.id }}/manifest.json">manifest.json</a>
+      </div>
+    {% endif %}
+  </div>
+
+  <div class="panel" style="padding:20px 10px;margin-top:12px">
+    <table>
+      <thead><tr>
+        <th style="padding-left:20px">#</th><th>Filename</th>
+        <th class="hide-sm">Start</th><th class="hide-sm">Length</th>
+        <th>Status</th><th></th>
+      </tr></thead>
+      <tbody id="clipRows">
+      {% for clip in clips %}
+        <tr data-sequence="{{ clip.sequence }}">
+          <td style="padding-left:20px" class="mono">{{ '%02d'|format(clip.sequence) }}</td>
+          <td class="mono" style="font-size:12px">{{ clip.output_filename }}
+            {% if clip.error %}<div class="muted" style="color:var(--danger)">{{ clip.error }}</div>{% endif %}
+          </td>
+          <td class="hide-sm mono">{{ clip.start_seconds | timestamp }}</td>
+          <td class="hide-sm mono">
+            {{ '%.3f'|format(clip.end_seconds - clip.start_seconds) }}s
+            {% if clip.rendered_duration %}
+              <span class="muted" title="actually rendered">({{ '%.3f'|format(clip.rendered_duration) }}s)</span>
+            {% endif %}
+          </td>
+          <td><span class="badge {{ clip.status }}">{{ clip.status }}</span></td>
+          <td style="text-align:right;padding-right:20px">
+            {% if clip.status == 'complete' %}
+              <a href="/jobs/{{ job.id }}/clips/{{ clip.id }}">Download</a>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  {% if job.expires_at %}
+    <p class="muted" style="font-size:13px">
+      These clips are deleted on {{ job.expires_at.strftime('%d %B %Y') }},
+      {{ retention_days }} days after rendering.
+      {% if job.source_deleted_at %}The source video has already been removed to save space.{% endif %}
+    </p>
+  {% endif %}
+{% endif %}
+
+{% if job.status == 'failed' %}
+  <form method="post" action="/jobs/{{ job.id }}/cuts" style="margin-top:14px">
+    <input type="hidden" name="cuts" value="{{ cuts_text or '' }}">
+    <a class="btn secondary" href="/jobs/{{ job.id }}">Try a different cut list</a>
+  </form>
+{% endif %}
+
+{% if job.status in ('uploading','uploaded','probing','queued','rendering') %}
+<script>
+// Poll rather than refresh, so the page does not jump while it is being read.
+const total = {{ clips|length }};
+let misses = 0;
+setInterval(async () => {
+  try {
+    const res = await fetch('/jobs/{{ job.id }}/status');
+    if (!res.ok) return;
+    const data = await res.json();
+    misses = 0;
+
+    const bar = document.getElementById('bar');
+    if (bar && total) {
+      bar.style.width = (data.clips_done / total * 100) + '%';
+      document.getElementById('count').textContent = `${data.clips_done} / ${total}`;
+    }
+    for (const clip of data.clips) {
+      const row = document.querySelector(`tr[data-sequence="${clip.sequence}"] .badge`);
+      if (row && row.textContent.trim() !== clip.status) location.reload();
+    }
+    // A status change means a different page layout entirely.
+    if (data.status !== '{{ job.status }}') location.reload();
+  } catch (e) { if (++misses > 10) location.reload(); }
+}, 2500);
+</script>
+{% endif %}
+{% endblock %}

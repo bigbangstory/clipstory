@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Jobs - Clipstory{% endblock %}
+{% block content %}
+<div class="spread">
+  <div>
+    <h1>Jobs</h1>
+    <p class="sub">Every video you have cut, newest first.</p>
+  </div>
+  <a class="btn" href="/jobs/new">New job</a>
+</div>
+
+{% if not jobs %}
+  <div class="panel empty">
+    <p style="font-size:16px;color:var(--text)">No jobs yet</p>
+    <p>Upload a long video, paste your timestamps, get your clips back.</p>
+    <a class="btn" href="/jobs/new" style="margin-top:12px">Upload a video</a>
+  </div>
+{% else %}
+<div class="panel" style="padding:20px 10px">
+<table>
+  <thead><tr>
+    <th style="padding-left:20px">Video</th>
+    <th>Status</th><th class="hide-sm">Clips</th>
+    <th class="hide-sm">Size</th><th class="hide-sm">Created</th>
+  </tr></thead>
+  <tbody>
+  {% for job in jobs %}
+    <tr>
+      <td style="padding-left:20px">
+        <a href="/jobs/{{ job.id }}">{{ job.source_filename }}</a>
+        {% if user.is_admin and job.owner_email != user.email %}
+          <div class="muted" style="font-size:12px">{{ job.owner_email }}</div>
+        {% endif %}
+      </td>
+      <td><span class="badge {{ job.status }}">{{ job.status.replace('_',' ') }}</span></td>
+      <td class="hide-sm mono">{{ job.clip_count or 0 }}</td>
+      <td class="hide-sm mono">{{ job.source_bytes | human_bytes }}</td>
+      <td class="hide-sm muted mono">{{ job.created_at.strftime('%d %b %H:%M') }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Sign in - Clipstory{% endblock %}
+{% block content %}
+<div style="max-width:420px;margin:6vh auto">
+  <h1>Sign in</h1>
+  <p class="sub">Clipstory is invite-only. Enter the address you were invited with and we will email you a sign-in link.</p>
+
+  {% if error %}<div class="note bad">{{ error }}</div>{% endif %}
+
+  {% if sent %}
+    <div class="note good">
+      If that address is on the invite list, a sign-in link is on its way.
+      It works once and expires shortly.
+    </div>
+    <p class="muted" style="font-size:13px">
+      Nothing arrived? Check spam, or ask an admin to confirm you are on the list.
+    </p>
+  {% else %}
+    <div class="panel">
+      <form method="post" action="/login">
+        <label for="email">Email address</label>
+        <input id="email" type="email" name="email" required autofocus
+               autocomplete="email" placeholder="you@company.com">
+        <button class="btn" style="margin-top:14px;width:100%">Email me a link</button>
+      </form>
+    </div>
+  {% endif %}
+</div>
+{% endblock %}

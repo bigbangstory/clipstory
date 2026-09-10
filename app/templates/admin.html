@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}Team - Clipstory{% endblock %}
+{% block content %}
+<h1>Team access</h1>
+<p class="sub">Clipstory is invite-only. Only the addresses below can sign in, no matter who has the link.</p>
+
+{% if not email_configured %}
+<div class="note warn">
+  <b>No email provider configured.</b> Sign-in links are written to the server
+  log instead of being sent. Fine for testing; set <code>RESEND_API_KEY</code>
+  before inviting anyone who cannot read the logs.
+</div>
+{% endif %}
+
+<div class="panel">
+  <form method="post" action="/admin/invite" class="row">
+    <div style="flex:1;min-width:220px">
+      <label for="email">Invite an email address</label>
+      <input id="email" type="email" name="email" required placeholder="teammate@company.com">
+    </div>
+    <button class="btn" style="align-self:end">Invite</button>
+  </form>
+</div>
+
+<div class="panel" style="padding:20px 10px">
+<table>
+  <thead><tr>
+    <th style="padding-left:20px">Email</th><th>Role</th>
+    <th class="hide-sm">Last sign-in</th><th class="hide-sm">Invited by</th><th></th>
+  </tr></thead>
+  <tbody>
+  {% for invite in invites %}
+    <tr>
+      <td style="padding-left:20px" class="mono">{{ invite.email }}</td>
+      <td>{% if invite.is_admin %}<span class="badge complete">admin</span>
+          {% else %}<span class="badge pending">member</span>{% endif %}</td>
+      <td class="hide-sm muted mono">
+        {{ invite.last_login_at.strftime('%d %b %Y') if invite.last_login_at else 'never' }}</td>
+      <td class="hide-sm muted mono">{{ invite.invited_by or '-' }}</td>
+      <td style="text-align:right;padding-right:20px">
+        {% if invite.email != user.email %}
+        <form method="post" action="/admin/revoke" style="margin:0"
+              onsubmit="return confirm('Revoke access for {{ invite.email }}? Their jobs are kept.')">
+          <input type="hidden" name="email" value="{{ invite.email }}">
+          <button class="btn danger" style="padding:5px 11px;font-size:13px">Revoke</button>
+        </form>
+        {% else %}<span class="muted" style="font-size:12px">you</span>{% endif %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+<p class="muted" style="font-size:13px">
+  Revoking removes access immediately, including any signed-in session. The
+  person's jobs and clips are kept.
+</p>
+{% endblock %}

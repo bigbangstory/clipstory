@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Clipstory{% endblock %}</title>
+<style>
+:root{
+  --bg:#0f1115; --panel:#171a21; --panel-2:#1e222b; --line:#2a2f3a;
+  --text:#e6e9ef; --muted:#9aa3b2; --accent:#4ade80; --accent-dim:#166534;
+  --danger:#f87171; --danger-dim:#7f1d1d; --warn:#fbbf24; --radius:10px;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);
+  font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+header{border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:10}
+.bar{max-width:1080px;margin:0 auto;padding:14px 20px;display:flex;align-items:center;gap:20px}
+.brand{font-weight:700;font-size:17px;letter-spacing:-.2px;color:var(--text)}
+.brand span{color:var(--accent)}
+.bar nav{margin-left:auto;display:flex;align-items:center;gap:18px;font-size:14px}
+.bar nav .who{color:var(--muted)}
+main{max-width:1080px;margin:0 auto;padding:28px 20px 80px}
+h1{font-size:22px;margin:0 0 6px;letter-spacing:-.3px}
+h2{font-size:16px;margin:28px 0 12px;color:var(--text)}
+.sub{color:var(--muted);margin:0 0 22px;font-size:14px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:20px;margin-bottom:18px}
+.btn{display:inline-block;background:var(--accent);color:#07260f;border:0;border-radius:8px;
+  padding:9px 16px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit}
+.btn:hover{filter:brightness(1.08);text-decoration:none}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn.secondary{background:var(--panel-2);color:var(--text);border:1px solid var(--line)}
+.btn.danger{background:transparent;color:var(--danger);border:1px solid var(--danger-dim)}
+input[type=text],input[type=email],input[type=file],textarea{
+  width:100%;background:var(--bg);border:1px solid var(--line);border-radius:8px;
+  color:var(--text);padding:10px 12px;font-size:14px;font-family:inherit}
+textarea{font-family:var(--mono);font-size:13px;line-height:1.7;resize:vertical}
+input:focus,textarea:focus{outline:2px solid var(--accent-dim);border-color:var(--accent)}
+label{display:block;font-size:13px;color:var(--muted);margin-bottom:6px}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th{text-align:left;font-size:12px;text-transform:uppercase;letter-spacing:.06em;
+  color:var(--muted);font-weight:600;padding:0 10px 8px;border-bottom:1px solid var(--line)}
+td{padding:11px 10px;border-bottom:1px solid var(--line)}
+tr:last-child td{border-bottom:0}
+.mono{font-family:var(--mono);font-size:13px}
+.badge{display:inline-block;font-size:11px;font-weight:600;text-transform:uppercase;
+  letter-spacing:.05em;padding:3px 9px;border-radius:20px;border:1px solid}
+.badge.complete{color:var(--accent);border-color:var(--accent-dim);background:#0d2b18}
+.badge.failed{color:var(--danger);border-color:var(--danger-dim);background:#2b1010}
+.badge.pending,.badge.uploading,.badge.uploaded,.badge.awaiting_cuts{color:var(--muted);border-color:var(--line);background:var(--panel-2)}
+.badge.rendering,.badge.probing,.badge.queued{color:var(--warn);border-color:#78350f;background:#2b2010}
+.note{border-left:3px solid var(--line);padding:12px 16px;background:var(--panel-2);
+  border-radius:0 8px 8px 0;font-size:14px;color:var(--muted);margin:14px 0}
+.note.bad{border-left-color:var(--danger);color:#fecaca;background:#2b1010}
+.note.good{border-left-color:var(--accent);color:#bbf7d0;background:#0d2b18}
+.note.warn{border-left-color:var(--warn);color:#fde68a;background:#2b2010}
+.muted{color:var(--muted)}
+.progress{height:6px;background:var(--panel-2);border-radius:99px;overflow:hidden;margin:10px 0}
+.progress>div{height:100%;background:var(--accent);transition:width .3s ease;width:0}
+.empty{text-align:center;padding:56px 20px;color:var(--muted)}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.spread{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}
+.stat{display:flex;gap:26px;flex-wrap:wrap;font-size:13px;color:var(--muted);margin-top:4px}
+.stat b{color:var(--text);font-weight:600}
+@media(max-width:640px){.hide-sm{display:none}main{padding:18px 14px 60px}}
+</style>
+</head>
+<body>
+<header><div class="bar">
+  <a class="brand" href="/">clip<span>story</span></a>
+  {% if user %}<nav>
+    <a href="/">Jobs</a>
+    <a href="/jobs/new">New job</a>
+    {% if user.is_admin %}<a href="/admin">Team</a>{% endif %}
+    <span class="who hide-sm">{{ user.email }}</span>
+    <form method="post" action="/logout" style="margin:0">
+      <button class="btn secondary" style="padding:6px 12px">Sign out</button>
+    </form>
+  </nav>{% endif %}
+</div></header>
+<main>{% block content %}{% endblock %}</main>
+</body>
+</html>

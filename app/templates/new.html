@@ -1,0 +1,128 @@
+{% extends "base.html" %}
+{% block title %}New job - Clipstory{% endblock %}
+{% block content %}
+<h1>Upload a video</h1>
+<p class="sub">The file uploads in pieces, so a dropped connection resumes instead of starting over.</p>
+
+<div class="panel">
+  <label for="file">Video file</label>
+  <input id="file" type="file" accept="video/*,.mp4,.mov,.mkv,.avi,.webm,.m4v">
+  <div id="picked" class="muted" style="margin-top:10px;font-size:13px"></div>
+  <button id="start" class="btn" style="margin-top:16px" disabled>Start upload</button>
+</div>
+
+<div id="progressPanel" class="panel" style="display:none">
+  <div class="spread"><b id="phase">Uploading</b><span id="pct" class="mono">0%</span></div>
+  <div class="progress"><div id="bar"></div></div>
+  <div id="detail" class="muted mono" style="font-size:12px"></div>
+</div>
+
+<div id="failure" class="note bad" style="display:none"></div>
+
+<script>
+const CHUNK = {{ chunk_bytes }};
+const MAX = {{ max_bytes }};
+const fileInput = document.getElementById('file');
+const startBtn  = document.getElementById('start');
+const picked    = document.getElementById('picked');
+const panel     = document.getElementById('progressPanel');
+const bar       = document.getElementById('bar');
+const pct       = document.getElementById('pct');
+const phase     = document.getElementById('phase');
+const detail    = document.getElementById('detail');
+const failure   = document.getElementById('failure');
+
+const human = b => {
+  const u = ['B','KB','MB','GB','TB']; let i = 0;
+  while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+  return b.toFixed(i ? 1 : 0) + ' ' + u[i];
+};
+
+const fail = msg => {
+  failure.textContent = msg;
+  failure.style.display = 'block';
+  startBtn.disabled = false;
+  startBtn.textContent = 'Retry upload';
+};
+
+fileInput.onchange = () => {
+  const f = fileInput.files[0];
+  failure.style.display = 'none';
+  if (!f) { startBtn.disabled = true; picked.textContent = ''; return; }
+  if (f.size > MAX) { picked.textContent = ''; fail(`That file is ${human(f.size)}, over the ${human(MAX)} limit.`); startBtn.disabled = true; return; }
+  picked.textContent = `${f.name} - ${human(f.size)}`;
+  startBtn.disabled = false;
+};
+
+startBtn.onclick = async () => {
+  const file = fileInput.files[0];
+  if (!file) return;
+  startBtn.disabled = true;
+  failure.style.display = 'none';
+  panel.style.display = 'block';
+
+  let jobId;
+  try {
+    const form = new FormData();
+    form.append('filename', file.name);
+    form.append('total_bytes', file.size);
+    const res = await fetch('/api/uploads', { method: 'POST', body: form });
+    if (!res.ok) return fail((await res.json()).error || 'Could not start the upload.');
+    jobId = (await res.json()).job_id;
+  } catch (e) { return fail('Could not reach the server: ' + e.message); }
+
+  // Resume from whatever the server already holds rather than assuming zero.
+  let offset = 0;
+  try {
+    const status = await fetch(`/api/uploads/${jobId}`);
+    if (status.ok) offset = (await status.json()).received_bytes;
+  } catch (e) { /* a fresh upload starts at zero anyway */ }
+
+  const started = Date.now();
+  while (offset < file.size) {
+    const end = Math.min(offset + CHUNK, file.size);
+    const slice = file.slice(offset, end);
+
+    let sent = false;
+    // Transient network trouble is expected on a multi-GB upload, so each
+    // chunk gets a few attempts with a backoff before the whole thing fails.
+    for (let attempt = 1; attempt <= 4 && !sent; attempt++) {
+      try {
+        const res = await fetch(`/api/uploads/${jobId}`, {
+          method: 'PUT',
+          headers: { 'X-Chunk-Offset': offset, 'Content-Type': 'application/octet-stream' },
+          body: slice,
+        });
+        if (res.ok) { offset = (await res.json()).received_bytes; sent = true; break; }
+        if (res.status === 409) {
+          // The server and client disagree on position. Trust the server.
+          const status = await fetch(`/api/uploads/${jobId}`);
+          if (status.ok) { offset = (await status.json()).received_bytes; sent = true; break; }
+        }
+        if (attempt === 4) return fail((await res.json()).error || `Upload failed at ${human(offset)}.`);
+      } catch (e) {
+        if (attempt === 4) return fail(`Connection lost at ${human(offset)}. Reload and pick the same file to resume.`);
+      }
+      await new Promise(r => setTimeout(r, 500 * 2 ** attempt));
+    }
+
+    const done = offset / file.size;
+    bar.style.width = pct.textContent = (done * 100).toFixed(1) + '%';
+    const rate = offset / ((Date.now() - started) / 1000);
+    const left = rate > 0 ? (file.size - offset) / rate : 0;
+    detail.textContent = `${human(offset)} of ${human(file.size)} - ${human(rate)}/s`
+      + (left > 1 ? ` - about ${Math.ceil(left / 60)} min left` : '');
+  }
+
+  phase.textContent = 'Finishing';
+  try {
+    const res = await fetch(`/api/uploads/${jobId}/complete`, { method: 'POST' });
+    if (!res.ok) return fail((await res.json()).error || 'The upload did not complete.');
+  } catch (e) { return fail('Could not finalise the upload: ' + e.message); }
+
+  phase.textContent = 'Uploaded';
+  detail.textContent = 'Reading the video, one moment.';
+  window.location = `/jobs/${jobId}`;
+};
+</script>
+{% endblock %}
