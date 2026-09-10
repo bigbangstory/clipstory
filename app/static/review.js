@@ -81,7 +81,7 @@
         <td class="mono">${len.toFixed(1)}s</td>
         <td><span class="badge ${row.status || 'pending'}">${row.status || 'new'}</span></td>
         <td class="actions">
-          <button data-act="audition" title="Play this range in the source player">&#9654; range</button>
+          ${player ? `<button data-act="audition" title="Play this range in the source player">&#9654; range</button>` : ''}
           ${row.status === 'complete' && row.id ? `<button data-act="playclip" title="Play the rendered file">&#9654; clip</button>
             <a href="/jobs/${jobId}/clips/${row.id}">Download</a>` : ''}
           ${editable ? `<button data-act="delete" class="danger" title="Remove this clip">&times;</button>` : ''}
