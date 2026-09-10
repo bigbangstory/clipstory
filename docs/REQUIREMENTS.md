@@ -1,55 +1,40 @@
-# Clipstory - Requirement Specification (v1)
+# Clipstory - Requirement Specification (v2, simplified)
 
-Status: draft for sign-off. No code written until this is agreed.
-Last updated: 2026-09-09
+Status: draft for sign-off.
+Last updated: 2026-09-10
+Supersedes v1. Change log at the bottom.
 
 ---
 
-## 1. What this is
+## 1. What it is
 
-A hosted (cloud-only) tool that takes one long video, produces a transcript with
-timestamps, lets the operator paste a list of cut points, and renders multiple
-frame-accurate clips named in sequence, downloadable as a zip.
+A hosted tool. Your team logs in from any browser, uploads a long video, pastes
+a list of timestamp ranges, and gets back multiple clips cut at exactly those
+points, named in sequence, downloadable as a zip.
 
-Nothing runs on the operator's machine. Accessible from any browser.
+Nothing installed on anyone's machine.
 
-## 2. What this is NOT (v1 scope guard)
+## 2. The flow
 
-- No AI/LLM selection of highlights. Cut points are supplied by a human.
-- No vertical 9:16 reframing or face tracking.
-- No burned-in subtitles.
-- No multi-user teams, roles or client accounts.
-- No editing beyond trimming (no transitions, music, colour, overlays).
+1. Log in with a magic link sent to your work email.
+2. Upload a long video. It goes straight from the browser to storage.
+3. Paste timestamp ranges into a text box.
+4. Confirm the parsed table.
+5. Render. Watch progress.
+6. Download the clips, individually or as one zip.
 
-Each of these is a defensible v2 item. None is in v1.
+## 3. Not in scope
 
-## 3. Core user flow
+No AI picking cuts. No vertical reframing. No burned-in subtitles. No editing
+beyond trimming. Transcription comes later, in Phase 2.
 
-1. **Upload** - operator selects a long video in the browser. The file goes
-   directly to object storage via a resumable, presigned upload. It never
-   passes through the web app server.
-2. **Probe** - worker reads duration, container, video/audio codecs, resolution,
-   fps, and whether the frame rate is constant or variable. Stored on the job.
-3. **Transcribe** - worker extracts audio and produces a transcript with
-   segment-level and word-level timestamps. Displayed alongside the video in the
-   browser so the operator can find their moments.
-4. **Define cuts** - operator pastes a plain-text list of timestamp ranges into
-   a text box. Parsed, validated, previewed as a table before rendering.
-5. **Render** - worker cuts each range as its own MP4, frame-accurate.
-6. **Deliver** - clips listed with individual download links, plus a
-   "Download all" zip of the batch. Plus a manifest.
+## 4. Cut accuracy
 
-## 4. Cut accuracy - the non-negotiable part
+Every clip is re-encoded so it starts on the exact frame requested.
 
-The stated requirement: cut at the exact point given, never approximately.
-
-**Decision: frame-accurate re-encode.** Stream-copy (`-c copy`) cannot honour an
-arbitrary timestamp because it can only start a file on a keyframe, so it silently
-moves the cut by up to the keyframe interval (commonly 2-10 seconds on uploaded
-footage). That is exactly the failure mode this tool exists to avoid, so
-stream-copy is rejected for v1 even though it is faster.
-
-Per-clip command shape:
+Stream copy (`-c copy`) is rejected. It can only start a file on a keyframe, so
+it silently moves your cut by up to the keyframe interval, commonly 2 to 10
+seconds. That is the failure this tool exists to prevent.
 
 ```
 ffmpeg -ss <start> -i <source> -t <duration> \
@@ -59,30 +44,20 @@ ffmpeg -ss <start> -i <source> -t <duration> \
        <output>
 ```
 
-Notes on the choices:
-- `-ss` before `-i` gives fast seek; with re-encode ffmpeg decodes from the
-  preceding keyframe and discards, so the output still starts on the exact
-  requested frame. Accuracy is preserved, seek time is not wasted.
-- `-crf 18` is visually transparent for social/marketing use.
-- `-preset veryfast` trades file size for render time. Tunable per job later.
-- `+faststart` puts the moov atom first so clips stream instantly on the web.
-- Audio is always re-encoded to AAC to guarantee a clean start with no priming
-  gap at the cut.
+`-ss` before `-i` seeks fast; with re-encode the output still begins on the
+exact frame. CRF 18 is visually transparent. `+faststart` makes clips stream
+instantly.
 
-**Verification requirement:** after each render the worker probes the output and
-asserts the actual duration is within one frame of the requested duration. A clip
-that fails this check is marked failed, not silently delivered.
+After each render the worker probes the output and asserts the duration is
+within one frame of what was asked. A clip that fails is marked failed, never
+delivered silently.
 
-**Cost of this decision:** roughly 15-40 seconds of render per 1080p clip on a
-2 vCPU worker, versus about 1 second for stream copy. This is the correct trade
-for a tool whose whole purpose is exact cuts. If render times become painful in
-real use, "smart cut" (copy the interior, re-encode only the head and tail
-fragments, concatenate) is the v2 optimisation. It is materially more code and
-has real edge cases with variable frame rate sources, so it is not v1.
+Cost: roughly 15 to 40 seconds per 1080p clip instead of about 1 second. Correct
+trade for a tool whose entire point is exactness.
 
-## 5. Timestamp input format
+## 5. Timestamp input
 
-Single text box, one clip per line. The parser accepts:
+One clip per line:
 
 ```
 00:04:17 - 00:05:22
@@ -92,132 +67,123 @@ Single text box, one clip per line. The parser accepts:
 00:12:03 - 00:13:40 | Founder origin story
 ```
 
-Rules:
-- Separator: `-`, `->`, `to`, or a comma. Whitespace ignored.
-- `HH:MM:SS`, `MM:SS`, `HH:MM:SS.mmm` and bare seconds all accepted.
-- Optional label after a `|`, used in the filename and manifest.
-- Blank lines and lines starting with `#` ignored.
+Accepts `-`, `->`, `to` or a comma as separator. Accepts `HH:MM:SS`, `MM:SS`,
+`HH:MM:SS.mmm` and bare seconds. Optional label after `|`. Ignores blank lines
+and lines starting with `#`.
 
-Validation, all shown before any render starts:
-- start must be < end
-- end must be <= source duration
-- minimum clip length 1 second
-- overlapping ranges are allowed but flagged as a warning, not an error
-- any unparseable line blocks the job with the offending line number quoted
+Blocks the job with the offending line quoted if: start is not before end, end
+exceeds the video duration, a clip is under 1 second, or a line will not parse.
+Overlapping ranges are allowed but warned about.
 
-The parsed list renders as a table (number, start, end, duration, label) for the
-operator to confirm. Nothing renders until they confirm.
+The parsed list is shown as a table. Nothing renders until it is confirmed.
 
-## 6. Output naming
-
-Default pattern:
+## 6. Naming and output
 
 ```
 {source_slug}_clip_{NN}.mp4
 ```
 
-- `NN` is zero-padded, sequenced in the order the ranges were pasted, starting
-  at 01. Padding widens automatically past 99 clips.
-- `source_slug` is the original filename, lowercased, non-alphanumerics collapsed
-  to hyphens, truncated to 60 chars.
-- If a label was supplied it is appended: `podcast-ep12_clip_03_founder-origin-story.mp4`
-- Pattern is configurable per job via a template string, with the sequence
-  number always mandatory.
+Zero-padded, numbered in the order pasted, starting at 01. Padding widens past
+99 clips. With a label: `podcast-ep12_clip_03_founder-origin-story.mp4`
 
-Example batch:
-```
-podcast-ep12_clip_01.mp4
-podcast-ep12_clip_02.mp4
-podcast-ep12_clip_03.mp4
-```
+Each job delivers the MP4s, a `manifest.json` (clip number, filename, start,
+end, duration, label, probed duration), and `all_clips.zip` streamed on demand
+rather than stored twice.
 
-## 7. Deliverables per job
+## 7. Access
 
-- The clip MP4s.
-- `manifest.json` and `manifest.csv`: clip number, filename, start, end,
-  duration, label, transcript text falling inside the range, and the rendered
-  file's probed duration.
-- `all_clips.zip` containing the clips and both manifests, streamed on demand
-  rather than pre-built, so a large batch does not sit in storage twice.
+Magic-link login, no passwords to manage.
 
-## 8. Architecture and hosting - recommendation
+**Access is restricted to an allowlist, not open to anyone with the URL.** An
+open tool means anyone can upload gigabytes and burn hours of CPU on your bill,
+and you become the host of whatever they upload. The allowlist is either your
+email domain or a list of invited addresses. Adding a teammate takes seconds.
 
-**Recommendation: split web and worker.**
+Every user sees only their own jobs. An admin flag can see all of them.
 
-| Layer | Choice | Why |
+## 8. Architecture: two services
+
+Down from four in v1. This is the simplification.
+
+| What | Where | Why |
 |---|---|---|
-| Web UI | Next.js on Vercel | Already connected to this account. Handles auth, upload UI, transcript view, cut input, job status. Never touches ffmpeg. |
-| Storage | Supabase Storage | Source videos, rendered clips, transcripts. Resumable uploads for large files, presigned URLs so bytes never cross the app server. |
-| Database | Supabase Postgres | Jobs, clips, transcript segments, status. |
-| Auth | Supabase Auth | Single operator account in v1, email login. |
-| Worker | Long-running container on Railway, Render or Fly.io | ffmpeg needs a real filesystem, real CPU minutes and no execution timeout. |
-| Queue | Postgres-backed job table with row locking (`FOR UPDATE SKIP LOCKED`) | One less service. Adequate for single-operator volume. Swap to a dedicated queue only if concurrency becomes real. |
+| Web UI + ffmpeg worker | **One container on Railway**, with a persistent volume | Same repo, same deploy. The worker polls the jobs table in a background process. No separate host, no queue service. |
+| Auth + database + file storage | **Supabase** | Three things from one vendor, no code to write for any of them. |
 
-**Why the worker cannot be a serverless function.** Vercel and Supabase Edge
-Functions both cap execution time and give ephemeral, size-limited disk. A
-90-minute 1080p source is commonly 2-8 GB, and a batch of 10 frame-accurate
-clips is minutes of sustained CPU. That work needs a persistent container.
-This is the single most important infrastructure constraint in the project.
+Vercel is dropped. Splitting the UI onto a second host bought nothing at your
+volume and doubled the deploy surface.
 
-**The honest alternative:** run everything in one container on Railway or
-Render, Next.js and worker together. Fewer moving parts, one deploy, one bill,
-and genuinely simpler to debug. It scales worse and couples UI uptime to render
-load. Given single-operator volume, this is a legitimate choice and I would not
-argue hard against it. My recommendation stays with the split because storage
-and database on Supabase gives durable files and job history for free, and
-because the worker can then be restarted or resized without touching the UI.
+**Why the worker cannot be serverless.** Long video needs sustained CPU minutes
+and a real filesystem. This is the one constraint that is not negotiable.
 
-**Transcription: provider interface, one default.** The worker calls a
-`TranscriptionProvider` interface returning a normalised
-`{segments: [{start, end, text, words: [{start, end, word}]}]}` shape.
-Candidate implementations: a hosted Whisper API, AssemblyAI, Deepgram. Swapping
-provider is one class, no pipeline changes. Since the operator supplies cut
-points manually, the transcript is a reading aid, not a decision engine, so the
-cheapest adequate provider wins.
+**Job state lives in Postgres**, so a container restart or redeploy resumes
+instead of losing the work. The worker claims jobs with `SELECT ... FOR UPDATE
+SKIP LOCKED`. That is the whole queue.
 
-## 9. Data model (first pass)
+## 9. Verified plan requirements
+
+Two hard gates, both checked against vendor docs on 2026-09-10:
+
+**Supabase free tier caps uploads at 50 MB per file.** Fatal for long video. The
+Pro plan raises this to 500 GB. **Supabase Pro is required**, not optional.
+(https://supabase.com/docs/guides/storage/uploads/file-limits)
+
+**Railway volumes are capped by plan**: Trial 500 MB, Hobby 5 GB, Pro up to 1 TB.
+The worker needs room for one source plus its clips at once. A 90-minute 1080p
+source is roughly 3.4 to 5.4 GB, so **Hobby's 5 GB is too tight and Pro is
+required**. (https://docs.railway.com/volumes/reference)
+
+For contrast, Render caps `/tmp` at 2 GB on **every** instance type and evicts
+the service when exceeded, which rules Render out for this workload unless a
+persistent disk is attached.
+(https://community.render.com/t/increase-2gb-tmp-limit/22587)
+
+Confirm current pricing on each vendor's own pricing page before committing.
+I have verified the limits above, not the prices.
+
+## 10. Data model
 
 ```
-jobs
-  id, user_id, source_filename, source_path, status, error,
-  duration_seconds, width, height, fps, vfr, created_at, updated_at
+users          -- from Supabase Auth, plus an is_admin flag
 
-transcript_segments
-  id, job_id, index, start_seconds, end_seconds, text
+jobs           id, user_id, source_filename, source_path, status, error,
+               duration_seconds, width, height, fps, created_at
 
-clips
-  id, job_id, sequence, label, start_seconds, end_seconds,
-  output_filename, output_path, status, rendered_duration, error
+clips          id, job_id, sequence, label, start_seconds, end_seconds,
+               output_filename, output_path, status, rendered_duration, error
 ```
 
-Job status: `uploading -> probing -> transcribing -> awaiting_cuts -> rendering -> complete | failed`
+Status: `uploading -> probing -> awaiting_cuts -> rendering -> complete | failed`
 
-## 10. Open items needing your confirmation
+## 11. Still open
 
-1. **Storage file size limit.** Supabase Storage plans have per-file upload
-   ceilings that differ by tier. I have not verified the current numbers and
-   will not quote them from memory. Before we build, I need to confirm your
-   Supabase plan and its actual per-file limit against Supabase's own pricing
-   and storage docs. If your typical source exceeds it, storage moves to S3 or
-   Cloudflare R2 and everything else stays the same.
-2. **Typical source size and duration.** What is a realistic worst case for you,
-   1 hour at 1080p, or 3 hours at 4K? This sets worker size and cost directly.
-3. **Clips per video.** Typically how many ranges will you paste, 5 or 50? This
-   sets whether rendering needs to run in parallel.
-4. **Retention.** How long should source videos and clips stay in storage before
-   auto-deletion? Storage cost on multi-GB sources adds up and is the main
-   recurring bill in this design.
-5. **Who logs in.** Just you, or others on the team? v1 assumes one account.
+1. **Your worst realistic source.** 1 hour at 1080p, or 3 hours at 4K? This sets
+   the volume size and the monthly bill. Everything else is decided.
+2. **Retention.** How long do sources and clips survive before auto-delete?
+   Storage on multi-GB files is the main recurring cost.
+3. **Team size and allowlist.** Which email domain, or which addresses?
 
-## 11. Build phases
+## 12. Phases
 
-- **Phase 1** - upload, probe, paste timestamps, frame-accurate render, sequential
-  naming, per-clip download, zip download, manifest. Fully usable without any
-  transcription.
-- **Phase 2** - transcription provider, transcript display next to the video,
-  click a sentence to fill a timestamp into the cut box.
-- **Phase 3** - optimisations and extras as needed: smart cut, 9:16 versions,
-  burned-in captions, multi-user.
+**Phase 1** - login, upload, paste timestamps, exact cutting, sequential naming,
+zip download, manifest. Fully usable with no transcription and no API spend.
 
-Phase 1 is deliberately transcription-free so that the exactness of the cutting,
-which is the actual point of the tool, can be proven before any API spend.
+**Phase 2** - transcription, transcript shown beside the video, click a sentence
+to fill in a timestamp. Provider sits behind an interface so it can be swapped.
+
+**Phase 3** - only if real use demands it: smart cut for faster renders, 9:16
+versions, burned-in captions.
+
+Phase 1 deliberately has no transcription so the exactness of the cutting, which
+is the actual product, is proven before any recurring API cost.
+
+---
+
+## Change log from v1
+
+- Four services became two. Vercel dropped; UI and worker share one container.
+- Multi-user access moved from "out of scope" into Phase 1.
+- Render replaced by Railway, on a verified 2 GB `/tmp` cap.
+- Supabase Pro confirmed as a hard requirement, not a preference.
+- Manifest CSV dropped; JSON only.
+- Open questions cut from five to three.
