@@ -1,0 +1,15 @@
+.git
+.github
+docs
+tests
+*.md
+.env
+data/
+.test-data/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+run-tests.sh
+pytest.ini
+requirements-dev.txt

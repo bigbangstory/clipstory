@@ -25,7 +25,7 @@ from starlette.background import BackgroundTask
 
 from app import auth, db, jobs
 from app.config import settings
-from app.naming import zip_filename
+from app.naming import clip_filename, zip_filename
 from app.timestamps import (
     TimestampError,
     find_overlaps,
@@ -353,7 +353,14 @@ def submit_cuts(
         return templates.TemplateResponse(request, "job.html", context, status_code=400)
 
     if confirm != "yes":
-        context |= {"preview": ranges, "overlaps": find_overlaps(ranges)}
+        # Show the filenames the renderer will actually produce, computed with
+        # the same function it uses. Anything approximated here would be a
+        # promise the render does not keep.
+        preview = [
+            (cut, clip_filename(job["source_filename"], cut.sequence, len(ranges), cut.label))
+            for cut in ranges
+        ]
+        context |= {"preview": preview, "overlaps": find_overlaps(ranges)}
         return templates.TemplateResponse(request, "job.html", context)
 
     jobs.set_cuts(job_id, ranges)

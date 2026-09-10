@@ -66,16 +66,14 @@
           <th>Length</th><th class="hide-sm">Label</th><th class="hide-sm">Filename</th>
         </tr></thead>
         <tbody>
-        {% for cut in preview %}
+        {% for cut, filename in preview %}
           <tr>
             <td style="padding-left:20px" class="mono">{{ '%02d'|format(cut.sequence) }}</td>
             <td class="mono">{{ cut.start | timestamp }}</td>
             <td class="mono">{{ cut.end | timestamp }}</td>
             <td class="mono">{{ '%.3f'|format(cut.duration) }}s</td>
             <td class="hide-sm">{{ cut.label or '' }}</td>
-            <td class="hide-sm mono muted" style="font-size:12px">
-              {{ job.source_filename | replace('.mp4','') | lower | replace(' ','-') }}_clip_{{ '%02d'|format(cut.sequence) }}.mp4
-            </td>
+            <td class="hide-sm mono muted" style="font-size:12px">{{ filename }}</td>
           </tr>
         {% endfor %}
         </tbody>

@@ -1,0 +1,72 @@
+# One command brings up the whole service: database, web, worker.
+#
+# The web and worker run the same image with different commands. They share the
+# clipstory-data volume because the worker writes clips that the web process
+# serves, and they coordinate through Postgres rather than through the
+# filesystem.
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: clipstory
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: clipstory
+    volumes:
+      - clipstory-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U clipstory"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    # Not published to the host. Only the app containers reach it.
+    expose:
+      - "5432"
+
+  web:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://clipstory:${POSTGRES_PASSWORD}@db:5432/clipstory
+      DATA_DIR: /data
+    volumes:
+      - clipstory-data:/data
+    # Bound to localhost only. Cloudflare Tunnel connects outbound, so the VM
+    # never needs an inbound port open to the internet.
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz').status==200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  worker:
+    build: .
+    restart: unless-stopped
+    command: python -m app.worker
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://clipstory:${POSTGRES_PASSWORD}@db:5432/clipstory
+      DATA_DIR: /data
+    volumes:
+      - clipstory-data:/data
+    depends_on:
+      db:
+        condition: service_healthy
+    # ffmpeg will use every core it is given. Capping leaves the web process
+    # responsive while a render is running on a 2-core box.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+
+volumes:
+  clipstory-db:
+  clipstory-data:

@@ -195,6 +195,9 @@ class TestFullPipeline:
         response = client.post(f"/jobs/{job_id}/cuts", data={"cuts": cut_list})
         assert response.status_code == 200
         assert "Confirm these 2 clips" in response.text
+        # The preview must promise the filenames the renderer actually writes.
+        assert "podcast-ep12_clip_01_founder-origin-story.mp4" in response.text
+        assert "podcast-ep12_clip_02.mp4" in response.text
         assert jobs.get_job(job_id)["status"] == jobs.AWAITING_CUTS, (
             "previewing must never queue the job"
         )
