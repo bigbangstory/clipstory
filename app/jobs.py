@@ -30,10 +30,17 @@ from typing import Any, Iterator, Sequence
 
 from psycopg.types.json import Json
 
-from app import db
+from app import db, edits
 from app.config import settings
-from app.media import CutVerificationError, MediaError, cut_clip, extract_audio, probe
-from app.naming import clip_filename
+from app.media import (
+    CutVerificationError,
+    MediaError,
+    cut_clip,
+    extract_audio,
+    probe,
+    render_edit,
+)
+from app.naming import clip_filename, edit_filename
 from app.storage import LocalDiskStorage, Storage
 from app.suggest import (
     SuggestionError,
@@ -62,6 +69,8 @@ COMPLETE = "complete"
 FAILED = "failed"
 SUGGEST_REQUESTED = "suggest_requested"
 SUGGESTING = "suggesting"
+EDIT_REQUESTED = "edit_requested"
+EDITING = "editing"
 FINALISED = "finalised"
 EXPIRED = "expired"
 
@@ -70,6 +79,7 @@ CLAIM_TRANSITIONS = {
     UPLOADED: PROBING,
     QUEUED: RENDERING,
     SUGGEST_REQUESTED: SUGGESTING,
+    EDIT_REQUESTED: EDITING,
 }
 
 # Statuses a job is "in flight" under a worker, and where it returns to if that
@@ -80,6 +90,10 @@ STALE_TRANSITIONS = {
     TRANSCRIBING: UPLOADED,
     RENDERING: QUEUED,
     SUGGESTING: SUGGEST_REQUESTED,
+    # A full-length export is the longest single thing the worker does, so it
+    # is the most likely to be interrupted by a restart. It must be re-queued,
+    # not stranded.
+    EDITING: EDIT_REQUESTED,
 }
 
 # A job left mid-flight by a crashed or restarted worker is returned to the
@@ -259,6 +273,21 @@ def transcript_segments_for(job_id: str) -> list[TranscriptSegment]:
 
 # ----------------------------------------------------------------- queue ----
 
+def _status_case(transitions: dict[str, str]) -> tuple[str, list[str]]:
+    """Build a SQL CASE expression straight from a transition table.
+
+    Generated rather than written out, so that adding a stage to
+    ``CLAIM_TRANSITIONS`` or ``STALE_TRANSITIONS`` cannot leave the SQL one
+    branch behind. The only thing interpolated is the literal ``WHEN %s THEN %s``
+    skeleton; every status still travels as a bound parameter.
+    """
+    branches = " ".join("WHEN %s THEN %s" for _ in transitions)
+    params: list[str] = []
+    for source, target in transitions.items():
+        params += [source, target]
+    return f"CASE status {branches} ELSE status END", params
+
+
 def claim_next_job(worker_id: str) -> dict[str, Any] | None:
     """Atomically take the oldest available job.
 
@@ -266,14 +295,11 @@ def claim_next_job(worker_id: str) -> dict[str, Any] | None:
     one worker: each transaction locks a different row instead of queuing up
     behind the same one.
     """
+    case, params = _status_case(CLAIM_TRANSITIONS)
     return db.query_one(
-        """
+        f"""
         UPDATE jobs SET
-            status = CASE status
-                WHEN %s THEN %s
-                WHEN %s THEN %s
-                WHEN %s THEN %s
-                ELSE status END,
+            status = {case},
             claimed_by = %s,
             claimed_at = now(),
             updated_at = now()
@@ -288,40 +314,23 @@ def claim_next_job(worker_id: str) -> dict[str, Any] | None:
         )
         RETURNING *
         """,
-        (
-            UPLOADED, CLAIM_TRANSITIONS[UPLOADED],
-            QUEUED, CLAIM_TRANSITIONS[QUEUED],
-            SUGGEST_REQUESTED, CLAIM_TRANSITIONS[SUGGEST_REQUESTED],
-            worker_id,
-            list(CLAIM_TRANSITIONS),
-        ),
+        tuple(params + [worker_id, list(CLAIM_TRANSITIONS)]),
     )
 
 
 def release_stale_claims() -> int:
     """Return jobs abandoned by a dead worker to the queue."""
+    case, params = _status_case(STALE_TRANSITIONS)
     with db.connection() as conn:
         cursor = conn.execute(
-            """
+            f"""
             UPDATE jobs SET
-                status = CASE status
-                    WHEN %s THEN %s
-                    WHEN %s THEN %s
-                    WHEN %s THEN %s
-                    WHEN %s THEN %s
-                    ELSE status END,
+                status = {case},
                 claimed_by = NULL, claimed_at = NULL, updated_at = now()
             WHERE status = ANY(%s)
               AND claimed_at < now() - make_interval(mins => %s)
             """,
-            (
-                PROBING, STALE_TRANSITIONS[PROBING],
-                TRANSCRIBING, STALE_TRANSITIONS[TRANSCRIBING],
-                RENDERING, STALE_TRANSITIONS[RENDERING],
-                SUGGESTING, STALE_TRANSITIONS[SUGGESTING],
-                list(STALE_TRANSITIONS),
-                STALE_CLAIM_MINUTES,
-            ),
+            tuple(params + [list(STALE_TRANSITIONS), STALE_CLAIM_MINUTES]),
         )
         return cursor.rowcount or 0
 
@@ -714,6 +723,261 @@ def render_job(job: dict[str, Any]) -> None:
              job_id, rendered, failures, len(clips) - rendered - failures)
 
 
+# ------------------------------------------------------------------ edit ----
+
+def get_words(job_id: str) -> list[edits.Word]:
+    """Every word in the transcript, in order, with the timings Whisper gave.
+
+    The editor needs the text as well as the timings, which is why this exists
+    alongside ``get_word_boundaries`` (that one returns bare floats, for
+    snapping a clip edge to speech).
+    """
+    return edits.words_from_segments(
+        db.query(
+            "SELECT words FROM transcript_segments WHERE job_id = %s ORDER BY idx",
+            (job_id,),
+        )
+    )
+
+
+def get_edit(job_id: str) -> dict[str, Any] | None:
+    return db.query_one("SELECT * FROM edits WHERE job_id = %s", (job_id,))
+
+
+def ensure_edit(job_id: str) -> dict[str, Any]:
+    """The edit row for this job, created empty on first visit."""
+    existing = get_edit(job_id)
+    if existing is not None:
+        return existing
+    return db.query_one(
+        """
+        INSERT INTO edits (job_id, deletions) VALUES (%s, %s)
+        ON CONFLICT (job_id) DO UPDATE SET updated_at = now()
+        RETURNING *
+        """,
+        (job_id, Json([])),
+    )
+
+
+def deletions_of(job_id: str) -> list[edits.Deletion]:
+    edit = get_edit(job_id)
+    if edit is None:
+        return []
+    return [edits.Deletion.from_json(d) for d in (edit["deletions"] or [])]
+
+
+def save_edit(job_id: str, deletions: Sequence[edits.Deletion]) -> dict[str, Any]:
+    """Store the operator's deletions. Never queues a render.
+
+    Saving is cheap and happens constantly as the document is edited; encoding
+    is expensive and happens once, when Export is pressed.
+    """
+    ensure_edit(job_id)
+    return db.query_one(
+        """
+        UPDATE edits SET deletions = %s, status = 'draft', error = NULL,
+                         updated_at = now()
+        WHERE job_id = %s
+        RETURNING *
+        """,
+        (Json([d.to_json() for d in deletions]), job_id),
+    )
+
+
+def save_edit_from_words(
+    job_id: str, deletions: Sequence[edits.Deletion]
+) -> dict[str, Any]:
+    """Save deletions derived from struck-out words, keeping the pause trims.
+
+    The editor rebuilds its list from which words are struck through, which is
+    the right model for anything a person can point at. A shortened pause is
+    the exception: it lives in the gap *between* two words and strikes neither,
+    so it cannot be expressed that way and would be silently dropped on every
+    autosave. Keeping it here means the server holds the one piece of the edit
+    the document cannot represent.
+
+    To clear pause trims, run cleanup again with silence shortening switched
+    off; that replaces the automatic deletions wholesale.
+    """
+    pauses = [d for d in deletions_of(job_id) if d.reason == edits.SILENCE]
+    return save_edit(job_id, list(deletions) + pauses)
+
+
+def apply_cleanup(
+    job_id: str,
+    *,
+    remove_fillers: bool = True,
+    shorten_silences: bool = True,
+    filler_vocabulary: Sequence[str] | None = None,
+    keep_existing: bool = True,
+) -> dict[str, Any]:
+    """Run the automatic passes and merge them into the stored edit.
+
+    The operator's own deletions are kept by default: a cleanup button should
+    add to their work, not replace it. Running cleanup twice replaces the
+    previous automatic deletions rather than stacking them, so the counts shown
+    stay honest.
+    """
+    job = get_job(job_id)
+    if job is None:
+        raise ValueError("no such job")
+    duration = float(job["duration_seconds"] or 0)
+    if duration <= 0:
+        raise ValueError("this job has no duration yet")
+
+    words = get_words(job_id)
+    if not words and remove_fillers:
+        raise ValueError("this job has no transcript, so there are no filler words to find")
+
+    existing = deletions_of(job_id) if keep_existing else []
+    manual = [d for d in existing if d.reason == edits.MANUAL]
+
+    automatic = edits.auto_cleanup(
+        words,
+        duration,
+        remove_fillers=remove_fillers,
+        filler_vocabulary=(
+            filler_vocabulary
+            if filler_vocabulary is not None
+            else settings.filler_words
+        ),
+        shorten_silences=shorten_silences,
+        silence_threshold=settings.silence_threshold_seconds,
+        silence_target=settings.silence_target_seconds,
+    )
+    save_edit(job_id, manual + automatic)
+    return edit_state(get_job(job_id))
+
+
+def edit_state(job: dict[str, Any]) -> dict[str, Any]:
+    """Everything the editor page and its script need, in one shape.
+
+    ``keep_ranges`` is derived here rather than stored, and the same derived
+    list drives both the browser preview and the render, so the two cannot
+    disagree about what the edit means.
+    """
+    job_id = str(job["id"])
+    edit = get_edit(job_id)
+    duration = float(job["duration_seconds"] or 0)
+    stored = [edits.Deletion.from_json(d) for d in ((edit or {}).get("deletions") or [])]
+    words = get_words(job_id)
+
+    prepared = edits.prepare(stored, words, duration) if duration > 0 else []
+    try:
+        ranges = edits.keep_ranges(duration, prepared) if duration > 0 else []
+        problem = None
+    except edits.EditError as exc:
+        ranges, problem = [], str(exc)
+
+    return {
+        "job_id": job_id,
+        "duration": duration,
+        "deletions": [d.to_json() for d in stored],
+        "prepared": [d.to_json() for d in prepared],
+        "keep_ranges": [[round(s, 3), round(e, 3)] for s, e in ranges],
+        "kept_duration": round(sum(e - s for s, e in ranges), 3),
+        "removed_duration": round(duration - sum(e - s for s, e in ranges), 3),
+        "segment_count": len(ranges),
+        "summary": edits.summarise(stored),
+        "problem": problem,
+        "status": (edit or {}).get("status", "draft"),
+        "error": (edit or {}).get("error"),
+        "output_filename": (edit or {}).get("output_filename"),
+        "rendered_duration": (edit or {}).get("rendered_duration"),
+        "words": [
+            {"s": round(w.start, 3), "e": round(w.end, 3), "t": w.text, "d": deleted}
+            for w, deleted in zip(words, edits.mark_words(words, prepared))
+        ],
+    }
+
+
+def request_edit_render(job_id: str) -> None:
+    """Queue the export. The worker does the encoding; nothing waits here."""
+    job = get_job(job_id)
+    if job is None:
+        raise ValueError("no such job")
+    if job["status"] not in EDITABLE:
+        raise ValueError(f"cannot export while the job is {job['status']}")
+    if not job["source_path"] or job["source_deleted_at"]:
+        raise ValueError(
+            "the source video has been removed, so this edit can no longer be exported"
+        )
+
+    duration = float(job["duration_seconds"] or 0)
+    prepared = edits.prepare(deletions_of(job_id), get_words(job_id), duration)
+    # Fail here, in the request, where the operator can read the reason, rather
+    # than minutes later in a worker log.
+    edits.keep_ranges(duration, prepared)
+
+    ensure_edit(job_id)
+    db.execute(
+        "UPDATE edits SET status = 'pending', error = NULL, updated_at = now() WHERE job_id = %s",
+        (job_id,),
+    )
+    db.execute(
+        "UPDATE jobs SET status = %s, resume_status = %s, updated_at = now() WHERE id = %s",
+        (EDIT_REQUESTED, job["status"], job_id),
+    )
+
+
+def edit_job(job: dict[str, Any]) -> None:
+    """Worker stage: render the edited video.
+
+    The slowest thing the worker does, because unlike a clip it re-encodes the
+    whole timeline. It never fails the job itself: a failed export leaves the
+    clips and the transcript untouched and the document still editable.
+    """
+    job_id = str(job["id"])
+    resume = job.get("resume_status") or COMPLETE
+    store = storage()
+    duration = float(job["duration_seconds"] or 0)
+
+    db.execute(
+        "UPDATE edits SET status = 'rendering', updated_at = now() WHERE job_id = %s",
+        (job_id,),
+    )
+
+    try:
+        prepared = edits.prepare(deletions_of(job_id), get_words(job_id), duration)
+        ranges = edits.keep_ranges(duration, prepared)
+        filename = edit_filename(job["source_filename"])
+        destination_key = f"edits/{job_id}/{filename}"
+        destination = store.path_for(destination_key)
+
+        info = render_edit(
+            store.path_for(job["source_path"]),
+            destination,
+            ranges,
+            source_fps=float(job["fps"]) if job["fps"] else None,
+            has_audio=True,
+            timeout=settings.edit_timeout_seconds,
+        )
+    except (edits.EditError, MediaError, CutVerificationError, ValueError) as exc:
+        log.error("job %s edit export failed: %s", job_id, exc)
+        db.execute(
+            "UPDATE edits SET status = 'failed', error = %s, updated_at = now() WHERE job_id = %s",
+            (str(exc), job_id),
+        )
+        set_status(job_id, resume)
+        return
+
+    db.execute(
+        """
+        UPDATE edits SET status = 'complete', error = NULL, output_filename = %s,
+                         output_path = %s, output_bytes = %s, rendered_duration = %s,
+                         expected_duration = %s, segment_count = %s, updated_at = now()
+        WHERE job_id = %s
+        """,
+        (filename, destination_key, destination.stat().st_size, info.duration,
+         sum(e - s for s, e in ranges), len(ranges), job_id),
+    )
+    set_status(job_id, resume)
+    log.info(
+        "job %s exported an edit: %.1fs from %.1fs across %d segments",
+        job_id, info.duration, duration, len(ranges),
+    )
+
+
 # -------------------------------------------------------------- finalise ----
 
 def finalise_job(job_id: str) -> dict[str, Any]:
@@ -833,9 +1097,14 @@ def purge_expired() -> int:
         job_id = str(row["id"])
         store.delete(f"clips/{job_id}")
         store.delete(f"sources/{job_id}")
+        store.delete(f"edits/{job_id}")
         with db.connection() as conn:
             conn.execute(
                 "UPDATE clips SET output_path = NULL, output_bytes = NULL WHERE job_id = %s",
+                (job_id,),
+            )
+            conn.execute(
+                "UPDATE edits SET output_path = NULL, output_bytes = NULL WHERE job_id = %s",
                 (job_id,),
             )
             conn.execute(

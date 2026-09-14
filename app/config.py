@@ -21,6 +21,11 @@ def _int(name: str, default: int) -> int:
     return default if raw is None or not raw.strip() else int(raw)
 
 
+def _float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    return default if raw is None or not raw.strip() else float(raw)
+
+
 def _csv(name: str) -> list[str]:
     return [item.strip().lower() for item in os.getenv(name, "").split(",") if item.strip()]
 
@@ -84,6 +89,22 @@ class Settings:
     anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
     suggestion_count: int = _int("SUGGESTION_COUNT", 8)
     suggest_timeout_seconds: int = _int("SUGGEST_TIMEOUT_SECONDS", 1800)
+
+    # --- text-based editing -------------------------------------------------
+    # Disfluencies removed by the cleanup button. Anything conversational
+    # ("so", "like", "right") is deliberately absent: each is usually doing
+    # real work in a sentence, and a cleanup button should not silently change
+    # what someone said. app.edits.OPTIONAL_FILLERS holds those for opt-in use.
+    filler_words: list[str] = field(
+        default_factory=lambda: _csv("FILLER_WORDS") or None
+    )
+    # Pauses longer than the threshold are shortened to the target, not
+    # removed: speech with its pauses stripped sounds rushed.
+    silence_threshold_seconds: float = _float("SILENCE_THRESHOLD_SECONDS", 0.8)
+    silence_target_seconds: float = _float("SILENCE_TARGET_SECONDS", 0.4)
+    # A full-length export re-encodes the whole video, unlike a clip. Generous,
+    # because on two ARM cores this is the slowest thing the worker does.
+    edit_timeout_seconds: int = _int("EDIT_TIMEOUT_SECONDS", 4 * 3600)
 
     max_upload_bytes: int = _int("MAX_UPLOAD_BYTES", 8 * 1024**3)
     upload_chunk_bytes: int = _int("UPLOAD_CHUNK_BYTES", 8 * 1024**2)

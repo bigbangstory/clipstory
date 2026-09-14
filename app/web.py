@@ -20,7 +20,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
-from app import auth, db, jobs
+from app import auth, db, edits, jobs
 from app.config import settings
 from app.naming import zip_filename
 from app.timestamps import MIN_CLIP_SECONDS, TimestampError, format_timestamp, parse_cut_list
@@ -88,7 +88,7 @@ def require_admin(request: Request) -> dict[str, Any]:
 # these must come back as JSON so the page's own error handling can read them;
 # everywhere else a human is looking at a browser window and wants a page.
 JSON_PATH_PREFIXES = ("/api/", "/healthz")
-JSON_PATH_SUFFIXES = ("/status", ".json", "/apply")
+JSON_PATH_SUFFIXES = ("/status", ".json", "/apply", "/state", "/edit", "/cleanup", "/export")
 
 
 def wants_json(request: Request) -> bool:
@@ -420,6 +420,138 @@ def rerun_suggestions(job_id: str, user: dict = Depends(require_user)):
     except ValueError as exc:
         raise HTTPException(409, str(exc))
     return RedirectResponse(f"/jobs/{job_id}", status_code=303)
+
+
+# -------------------------------------------------------------------- edit --
+
+class DeletionRow(BaseModel):
+    start: float = Field(ge=0)
+    end: float = Field(gt=0)
+    reason: str = "manual"
+
+
+class SaveEditRequest(BaseModel):
+    deletions: list[DeletionRow]
+
+
+class CleanupRequest(BaseModel):
+    remove_fillers: bool = True
+    shorten_silences: bool = True
+    include_conversational: bool = False
+
+
+@app.get("/jobs/{job_id}/edit", response_class=HTMLResponse)
+def edit_page(job_id: str, request: Request, user: dict = Depends(require_user)):
+    """The transcript as a document. Striking words out here edits the video."""
+    job = jobs.get_job_for_user(job_id, user)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    jobs.ensure_edit(job_id)
+    return templates.TemplateResponse(
+        request,
+        "edit.html",
+        {
+            "user": user,
+            "job": job,
+            "edit": jobs.get_edit(job_id),
+            "edit_state": jobs.edit_state(job),
+            "editable": job["status"] in jobs.EDITABLE,
+            "source_available": bool(job["source_path"]) and not job["source_deleted_at"],
+            "has_transcript": bool(jobs.get_transcript(job_id)),
+            "retention_days": settings.clip_retention_days,
+            "silence_threshold": settings.silence_threshold_seconds,
+            "silence_target": settings.silence_target_seconds,
+        },
+    )
+
+
+@app.post("/jobs/{job_id}/edit")
+def save_edit(job_id: str, body: SaveEditRequest, user: dict = Depends(require_user)):
+    """Autosave the document. Cheap, frequent, and never queues a render."""
+    job = jobs.get_job_for_user(job_id, user)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    if job["status"] not in jobs.EDITABLE:
+        raise HTTPException(409, f"cannot edit while the job is {job['status']}")
+
+    duration = float(job["duration_seconds"] or 0)
+    deletions = []
+    for number, row in enumerate(body.deletions, start=1):
+        if row.start >= row.end:
+            raise HTTPException(400, f"deletion {number}: start must be before end")
+        if duration and row.end > duration + 0.001:
+            raise HTTPException(400, f"deletion {number}: past the end of the video")
+        deletions.append(edits.Deletion(start=row.start, end=row.end, reason=row.reason))
+
+    # Deliberately not a plain save. The editor can only describe deletions
+    # that strike out words, so shortened pauses have to be preserved
+    # server-side or every autosave would quietly undo them.
+    jobs.save_edit_from_words(job_id, deletions)
+    return jobs.edit_state(jobs.get_job(job_id))
+
+
+@app.get("/jobs/{job_id}/edit/state")
+def edit_state(job_id: str, user: dict = Depends(require_user)):
+    """Polled while an export runs, so the page updates without a refresh."""
+    job = jobs.get_job_for_user(job_id, user)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    return jobs.edit_state(job) | {"job_status": job["status"]}
+
+
+@app.post("/jobs/{job_id}/edit/cleanup")
+def edit_cleanup(job_id: str, body: CleanupRequest, user: dict = Depends(require_user)):
+    """Run the automatic passes, keeping the operator's own deletions."""
+    job = jobs.get_job_for_user(job_id, user)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    if job["status"] not in jobs.EDITABLE:
+        raise HTTPException(409, f"cannot edit while the job is {job['status']}")
+
+    vocabulary = None
+    if body.include_conversational:
+        # Opt-in only. Each of these is usually load-bearing in a sentence, so
+        # removing them by default would silently change what someone said.
+        vocabulary = set(edits.DEFAULT_FILLERS) | set(edits.OPTIONAL_FILLERS)
+
+    try:
+        return jobs.apply_cleanup(
+            job_id,
+            remove_fillers=body.remove_fillers,
+            shorten_silences=body.shorten_silences,
+            filler_vocabulary=vocabulary,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+
+
+@app.post("/jobs/{job_id}/edit/export")
+def edit_export(job_id: str, user: dict = Depends(require_user)):
+    """Queue the export. The worker encodes; nothing waits in this request."""
+    job = jobs.get_job_for_user(job_id, user)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    try:
+        jobs.request_edit_render(job_id)
+    except edits.EditError as exc:
+        raise HTTPException(400, str(exc))
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+    return {"status": jobs.get_job(job_id)["status"]}
+
+
+@app.get("/jobs/{job_id}/edit/download")
+def edit_download(job_id: str, user: dict = Depends(require_user)):
+    job = jobs.get_job_for_user(job_id, user)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    edit = jobs.get_edit(job_id)
+    if edit is None or not edit["output_path"]:
+        raise HTTPException(404, "this job has no exported edit")
+    path = jobs.storage().path_for(edit["output_path"])
+    if not path.exists():
+        raise HTTPException(410, "this export has been deleted under the retention policy")
+    return FileResponse(path, media_type="video/mp4", filename=edit["output_filename"])
 
 
 @app.post("/jobs/{job_id}/finalise")

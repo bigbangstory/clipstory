@@ -70,7 +70,9 @@ def process(job: dict) -> None:
             jobs.render_job(job)
         elif status == jobs.SUGGESTING:
             jobs.suggest_job(job)
-        else:  # pragma: no cover - claim_next_job only produces the three above
+        elif status == jobs.EDITING:
+            jobs.edit_job(job)
+        else:  # pragma: no cover - claim_next_job only produces the four above
             log.error("job %s claimed in unexpected status %s", job_id, status)
             jobs.set_status(job_id, jobs.FAILED, f"unexpected status {status}")
     except Exception as exc:  # noqa: BLE001

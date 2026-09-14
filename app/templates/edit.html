@@ -1,0 +1,135 @@
+{% extends "base.html" %}
+{% block title %}Edit {{ job.source_filename }} - Clipstory{% endblock %}
+{% block content %}
+
+<div class="spread">
+  <div>
+    <h1>{{ job.source_filename }}</h1>
+    <div class="stat">
+      <span><span class="badge {{ job.status }}">{{ job.status.replace('_',' ') }}</span></span>
+      {% if job.duration_seconds %}<span>Source <b>{{ job.duration_seconds | timestamp }}</b></span>{% endif %}
+      {% if job.transcript_language %}<span>Language <b>{{ job.transcript_language }}</b></span>{% endif %}
+    </div>
+  </div>
+  <div class="modes">
+    <a href="/jobs/{{ job.id }}">Clips</a>
+    <a href="/jobs/{{ job.id }}/edit" class="on">Edit</a>
+  </div>
+</div>
+
+{% if not has_transcript %}
+  <div class="note bad">
+    <b>No transcript.</b> Text editing needs one: the whole point is that the
+    words carry the timings. {{ job.transcript_error or "Transcription did not run for this video." }}
+  </div>
+{% elif not source_available %}
+  <div class="note warn">
+    <b>The source video has been removed.</b> This job was finalised, so the
+    full-length video it would edit no longer exists. The transcript is kept
+    below for reference.
+  </div>
+{% else %}
+
+<script id="editData" type="application/json">{{ edit_state | tojson }}</script>
+
+<div class="edit-layout">
+  <div class="doc-pane">
+    <div class="spread" style="margin-bottom:8px">
+      <h2 style="margin:0">Transcript</h2>
+      <div class="row" style="gap:8px">
+        <button class="btn secondary sm" id="strikeBtn" disabled>Delete selected</button>
+        <button class="btn secondary sm" id="restoreBtn" disabled>Restore selected</button>
+        <button class="btn secondary sm" id="undoBtn" disabled>Undo</button>
+      </div>
+    </div>
+    <div class="note" style="font-size:13px;margin-top:0">
+      Drag across words to select them, then <b>Delete</b>. Struck-out words are
+      cut from the video. Click a struck word to bring it back. Click any word to
+      jump the player there.
+    </div>
+    <div class="panel document" id="document"></div>
+  </div>
+
+  <aside class="edit-side">
+    <video id="player" controls preload="metadata" src="/jobs/{{ job.id }}/source"></video>
+    <label class="checkline" style="margin:0 0 12px">
+      <input type="checkbox" id="previewEdited" checked>
+      <span>Preview the edit, skipping deleted parts</span>
+    </label>
+
+    <div class="panel">
+      <div class="figures">
+        <div><span class="fig" id="figKept">-</span><span class="figlab">final length</span></div>
+        <div><span class="fig" id="figRemoved">-</span><span class="figlab">removed</span></div>
+        <div><span class="fig" id="figSegments">-</span><span class="figlab">cuts</span></div>
+      </div>
+      <div id="breakdown" class="muted" style="font-size:13px;margin-top:10px"></div>
+      <div id="editProblem" class="note bad" style="display:none;margin:12px 0 0"></div>
+    </div>
+
+    <div class="panel">
+      <b style="font-size:14px">One-click cleanup</b>
+      <label class="checkline"><input type="checkbox" id="optFillers" checked>
+        <span>Remove filler words<br><span class="muted">um, uh, erm, hmm, ah</span></span></label>
+      <label class="checkline"><input type="checkbox" id="optConversational">
+        <span>Also remove conversational fillers<br>
+          <span class="muted">so, like, right, you know, I mean. Off by default:
+          these often carry meaning.</span></span></label>
+      <label class="checkline"><input type="checkbox" id="optSilence" checked>
+        <span>Shorten long pauses<br>
+          <span class="muted">over {{ silence_threshold }}s trimmed back to {{ silence_target }}s, not removed</span></span></label>
+      <button class="btn secondary" id="cleanupBtn" style="width:100%;margin-top:10px">Run cleanup</button>
+      <p class="muted" style="font-size:12px;margin:10px 0 0">
+        Your own deletions are kept. Running it again replaces the previous
+        automatic pass rather than stacking another one on top.
+      </p>
+    </div>
+
+    <div class="panel">
+      <b style="font-size:14px">Export</b>
+      {% if job.status in ('edit_requested', 'editing') %}
+        <div class="note warn" style="margin:10px 0">
+          <b>Exporting now.</b> Re-encoding the whole video in the background.
+          This page updates itself when it finishes.
+        </div>
+      {% endif %}
+      {% if edit and edit.status == 'complete' and edit.output_path %}
+        <div class="note good" style="margin:10px 0">
+          Exported, {{ '%.1f'|format(edit.rendered_duration or 0) }}s from
+          {{ edit.segment_count }} segment{{ 's' if edit.segment_count != 1 }}.
+        </div>
+        <a class="btn" style="width:100%;text-align:center" href="/jobs/{{ job.id }}/edit/download">Download</a>
+      {% elif edit and edit.status == 'failed' %}
+        <div class="note bad" style="margin:10px 0">{{ edit.error }}</div>
+      {% endif %}
+      <button class="btn {{ 'secondary' if edit and edit.status == 'complete' }}"
+              id="exportBtn" style="width:100%;margin-top:10px"
+              {{ 'disabled' if not editable }}>
+        {{ 'Export again' if edit and edit.status == 'complete' else 'Export edited video' }}
+      </button>
+      <p class="muted" style="font-size:12px;margin:10px 0 0">
+        Editing above is instant. Exporting re-encodes the whole video and runs
+        in the background, so it is the slow part. You can close the page.
+      </p>
+    </div>
+  </aside>
+</div>
+
+<script src="/static/edit.js"></script>
+{% endif %}
+
+{% if job.status in ('edit_requested', 'editing') %}
+<script>
+// The export is running in the worker. Poll rather than refresh so the page
+// does not jump while it is being read.
+setInterval(async () => {
+  try {
+    const res = await fetch('/jobs/{{ job.id }}/edit/state');
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data.job_status !== '{{ job.status }}') location.reload();
+  } catch (e) { /* transient; the next tick tries again */ }
+}, 4000);
+</script>
+{% endif %}
+{% endblock %}

@@ -62,6 +62,11 @@ def upload(client, source_path, filename="Podcast Ep12.mp4") -> str:
     return job_id
 
 
+def marked_source_path(job_id: str):
+    """The source file still on disk for a job, for frame comparisons."""
+    return jobs.storage().path_for(jobs.get_job(job_id)["source_path"])
+
+
 def run_worker_once() -> dict | None:
     job = jobs.claim_next_job("test-worker")
     if job is None:
@@ -331,3 +336,321 @@ class TestPrecutPipeline:
 
     def test_health_endpoint_reports_ok(self, client):
         assert client.get("/healthz").json()["status"] == "ok"
+
+
+@requires_ffmpeg
+class TestTextEditing:
+    """The second mode: edit the transcript, the video follows."""
+
+    @staticmethod
+    def _spoken_provider():
+        """A transcript with real filler words and a long pause in it."""
+        from app.transcription import TranscriptSegment, TranscriptionProvider, Word
+
+        lines = [
+            (0.0, "So um the first thing"),
+            (5.0, "is uh pricing matters"),
+            (10.0, "and that is the whole point"),
+            # 5s of dead air between this and the next line
+            (20.0, "thanks for listening"),
+        ]
+
+        class Spoken(TranscriptionProvider):
+            name, enabled = "spoken", True
+
+            def transcribe(self, audio_path):
+                segments = []
+                for index, (start, text) in enumerate(lines):
+                    tokens = text.split()
+                    step = 4.0 / len(tokens)
+                    words = [
+                        Word(round(start + i * step, 3), round(start + (i + 1) * step, 3), token)
+                        for i, token in enumerate(tokens)
+                    ]
+                    segments.append(
+                        TranscriptSegment(index, start, round(start + 4.0, 3), text, words)
+                    )
+                return segments, "en"
+
+        return Spoken()
+
+    @pytest.fixture
+    def spoken_job(self, client, marked_source):
+        """A job whose transcript contains fillers and a long silence."""
+        from app import suggest, transcription
+        from tests.conftest import FakeSuggestions
+
+        transcription.set_provider(self._spoken_provider())
+        suggest.set_provider(FakeSuggestions(clips=[]))
+        try:
+            sign_in(client, ADMIN)
+            job_id = upload(client, marked_source, "Interview.mp4")
+            drain_worker()
+            yield job_id
+        finally:
+            transcription.set_provider(None)
+            suggest.set_provider(None)
+
+    def test_the_editor_renders_the_transcript_as_a_document(self, client, spoken_job):
+        page = client.get(f"/jobs/{spoken_job}/edit")
+        assert page.status_code == 200
+        assert "pricing" in page.text
+        assert "One-click cleanup" in page.text
+        assert "Export edited video" in page.text
+
+    def test_both_modes_link_to_each_other(self, client, spoken_job):
+        assert f"/jobs/{spoken_job}/edit" in client.get(f"/jobs/{spoken_job}").text
+        assert f'href="/jobs/{spoken_job}"' in client.get(f"/jobs/{spoken_job}/edit").text
+
+    def test_saving_a_deletion_never_queues_a_render(self, client, spoken_job):
+        before = jobs.get_job(spoken_job)["status"]
+        response = client.post(
+            f"/jobs/{spoken_job}/edit",
+            json={"deletions": [{"start": 5.0, "end": 9.0, "reason": "manual"}]},
+        )
+        assert response.status_code == 200
+        state = response.json()
+        # 4s of words, but the cut is snapped outward into the half-second of
+        # silence either side so it lands where nobody is speaking. That is the
+        # intended behaviour, not drift.
+        assert state["removed_duration"] == pytest.approx(5.0, abs=0.1)
+        assert jobs.get_job(spoken_job)["status"] == before, "saving must not start work"
+        assert jobs.get_edit(spoken_job)["status"] == "draft"
+
+    def test_the_saved_state_marks_the_right_words_as_cut(self, client, spoken_job):
+        state = client.post(
+            f"/jobs/{spoken_job}/edit",
+            json={"deletions": [{"start": 5.0, "end": 9.0, "reason": "manual"}]},
+        ).json()
+        cut = [w["t"] for w in state["words"] if w["d"]]
+        assert cut == ["is", "uh", "pricing", "matters"]
+
+    def test_keep_ranges_are_the_complement_of_the_deletions(self, client, spoken_job):
+        state = client.post(
+            f"/jobs/{spoken_job}/edit",
+            json={"deletions": [{"start": 5.0, "end": 9.0, "reason": "manual"}]},
+        ).json()
+        assert len(state["keep_ranges"]) == 2
+        assert state["keep_ranges"][0][0] == 0.0
+        assert state["kept_duration"] + state["removed_duration"] == pytest.approx(30.0, abs=0.1)
+
+    def test_a_deletion_past_the_end_is_rejected(self, client, spoken_job):
+        response = client.post(
+            f"/jobs/{spoken_job}/edit", json={"deletions": [{"start": 5.0, "end": 99.0}]}
+        )
+        assert response.status_code == 400
+        assert "past the end" in response.json()["error"]
+
+    def test_a_backwards_deletion_is_rejected(self, client, spoken_job):
+        response = client.post(
+            f"/jobs/{spoken_job}/edit", json={"deletions": [{"start": 9.0, "end": 5.0}]}
+        )
+        assert response.status_code == 400
+
+    def test_cleanup_removes_fillers_and_shortens_the_pause(self, client, spoken_job):
+        state = client.post(
+            f"/jobs/{spoken_job}/edit/cleanup",
+            json={"remove_fillers": True, "shorten_silences": True},
+        ).json()
+        summary = state["summary"]
+        assert summary["filler"]["count"] == 2, "um and uh"
+        assert summary["silence"]["count"] >= 1, "the gap before the last line"
+        cut = [w["t"] for w in state["words"] if w["d"]]
+        assert cut == ["um", "uh"]
+
+    def test_cleanup_leaves_conversational_words_alone_by_default(self, client, spoken_job):
+        state = client.post(
+            f"/jobs/{spoken_job}/edit/cleanup", json={"remove_fillers": True}
+        ).json()
+        cut = [w["t"] for w in state["words"] if w["d"]]
+        assert "So" not in cut and "and" not in cut
+
+    def test_conversational_words_can_be_opted_into(self, client, spoken_job):
+        state = client.post(
+            f"/jobs/{spoken_job}/edit/cleanup",
+            json={"remove_fillers": True, "include_conversational": True,
+                  "shorten_silences": False},
+        ).json()
+        assert "So" in [w["t"] for w in state["words"] if w["d"]]
+
+    def test_cleanup_keeps_the_operators_own_deletions(self, client, spoken_job):
+        client.post(f"/jobs/{spoken_job}/edit",
+                    json={"deletions": [{"start": 10.0, "end": 14.0, "reason": "manual"}]})
+        state = client.post(f"/jobs/{spoken_job}/edit/cleanup", json={}).json()
+        assert state["summary"]["manual"]["count"] == 1
+        assert state["summary"]["filler"]["count"] == 2
+
+    def test_running_cleanup_twice_does_not_stack(self, client, spoken_job):
+        first = client.post(f"/jobs/{spoken_job}/edit/cleanup", json={}).json()
+        second = client.post(f"/jobs/{spoken_job}/edit/cleanup", json={}).json()
+        assert first["summary"]["total"]["count"] == second["summary"]["total"]["count"]
+
+    def test_export_renders_in_the_worker_and_can_be_downloaded(self, client, spoken_job, tmp_path):
+        source = marked_source_path(spoken_job)  # captured before finalise could remove it
+        state = client.post(
+            f"/jobs/{spoken_job}/edit",
+            json={"deletions": [{"start": 10.0, "end": 20.0, "reason": "manual"}]},
+        ).json()
+        # Expectations come from the state the server derived, not from the raw
+        # request: snapping widens the cut into the surrounding silence, which
+        # is the point of it.
+        (keep_a, keep_b) = state["keep_ranges"]
+        expected = state["kept_duration"]
+
+        before = jobs.get_job(spoken_job)["status"]
+        response = client.post(f"/jobs/{spoken_job}/edit/export")
+        assert response.status_code == 200
+        assert jobs.get_job(spoken_job)["status"] == jobs.EDIT_REQUESTED
+        assert jobs.get_edit(spoken_job)["status"] == "pending"
+
+        job = run_worker_once()
+        assert job["status"] == before, "the job returns to where it was"
+        edit = jobs.get_edit(spoken_job)
+        assert edit["status"] == "complete", edit["error"]
+        assert edit["rendered_duration"] == pytest.approx(expected, abs=0.1)
+        assert edit["segment_count"] == 2
+        assert edit["output_filename"] == "interview_edited.mp4"
+
+        download = client.get(f"/jobs/{spoken_job}/edit/download")
+        assert download.status_code == 200
+        assert download.headers["content-type"] == "video/mp4"
+        produced = tmp_path / "edited.mp4"
+        produced.write_bytes(download.content)
+
+        # The real proof. Duration alone cannot say *where* the join landed.
+        # A moment just after the join in the output must be the same picture
+        # as the corresponding moment in the source, on the far side of the cut.
+        # The first piece's rendered length is derived from what actually came
+        # out, not from the requested range: render_edit snaps boundaries onto
+        # frames, so the two differ by up to half a frame and comparing against
+        # the request would sample the neighbouring frame.
+        into_second_piece = 2.0
+        first_piece = edit["rendered_duration"] - (keep_b[1] - keep_b[0])
+        out_at = first_piece + into_second_piece
+        src_at = keep_b[0] + into_second_piece
+        after_join = extract_frame(produced, tmp_path / "after.png", at=out_at)
+        correct = extract_frame(source, tmp_path / "want.png", at=src_at)
+        wrong = extract_frame(source, tmp_path / "wrong.png", at=out_at)
+        assert psnr_between(after_join, correct) > 30.0, "the join did not land on the right frame"
+        assert psnr_between(after_join, wrong) < 30.0, "the deleted span is still present"
+
+    def test_exporting_does_not_disturb_the_clips(self, client, spoken_job):
+        before = [c["output_path"] for c in jobs.get_clips(spoken_job)]
+        client.post(f"/jobs/{spoken_job}/edit",
+                    json={"deletions": [{"start": 10.0, "end": 20.0}]})
+        client.post(f"/jobs/{spoken_job}/edit/export")
+        run_worker_once()
+        assert [c["output_path"] for c in jobs.get_clips(spoken_job)] == before
+
+    def test_an_edit_that_removes_everything_is_refused_in_the_request(self, client, spoken_job):
+        client.post(f"/jobs/{spoken_job}/edit",
+                    json={"deletions": [{"start": 0.0, "end": 30.0}]})
+        response = client.post(f"/jobs/{spoken_job}/edit/export")
+        assert response.status_code == 400
+        assert "restore something" in response.json()["error"]
+        assert jobs.get_job(spoken_job)["status"] != jobs.EDIT_REQUESTED
+
+    def test_a_stranded_export_is_returned_to_the_queue(self, client, spoken_job):
+        client.post(f"/jobs/{spoken_job}/edit",
+                    json={"deletions": [{"start": 10.0, "end": 20.0}]})
+        client.post(f"/jobs/{spoken_job}/edit/export")
+        # A worker that died five hours into a long export.
+        jobs.db.execute(
+            "UPDATE jobs SET status = %s, claimed_by = 'dead', "
+            "claimed_at = now() - interval '5 hours' WHERE id = %s",
+            (jobs.EDITING, spoken_job),
+        )
+        assert jobs.release_stale_claims() >= 1
+        assert jobs.get_job(spoken_job)["status"] == jobs.EDIT_REQUESTED
+
+    def test_export_is_refused_once_the_source_is_gone(self, client, spoken_job):
+        jobs.delete_source(spoken_job)
+        response = client.post(f"/jobs/{spoken_job}/edit/export")
+        assert response.status_code == 409
+        assert "no longer be exported" in response.json()["error"]
+
+    def test_the_editor_explains_itself_when_the_source_is_gone(self, client, spoken_job):
+        jobs.delete_source(spoken_job)
+        assert "source video has been removed" in client.get(f"/jobs/{spoken_job}/edit").text
+
+    def test_another_user_cannot_read_or_edit_someone_elses_document(self, client, spoken_job):
+        client.post("/admin/invite", data={"email": MEMBER}, follow_redirects=False)
+        sign_in(client, MEMBER)
+        assert client.get(f"/jobs/{spoken_job}/edit").status_code == 404
+        assert client.get(f"/jobs/{spoken_job}/edit/state").status_code == 404
+        assert client.post(f"/jobs/{spoken_job}/edit", json={"deletions": []}).status_code == 404
+        assert client.post(f"/jobs/{spoken_job}/edit/cleanup", json={}).status_code == 404
+        assert client.get(f"/jobs/{spoken_job}/edit/download").status_code == 404
+
+
+@requires_ffmpeg
+class TestEditorSaveDoesNotLosePauseTrims:
+    """Regression for a bug the API tests could not see.
+
+    The editor rebuilds its deletion list from which words are struck through.
+    A shortened pause strikes no word, because it lives in the gap between two
+    of them. Before this was fixed, every autosave silently discarded the pause
+    trims, so pressing Export threw away most of what cleanup had done: a
+    28-second saving became a 6-second one, with nothing in the UI to say so.
+    """
+
+    @pytest.fixture
+    def spoken_job(self, client, marked_source):
+        from app import suggest, transcription
+        from tests.conftest import FakeSuggestions
+
+        transcription.set_provider(TestTextEditing._spoken_provider())
+        suggest.set_provider(FakeSuggestions(clips=[]))
+        try:
+            sign_in(client, ADMIN)
+            job_id = upload(client, marked_source, "Interview.mp4")
+            drain_worker()
+            yield job_id
+        finally:
+            transcription.set_provider(None)
+            suggest.set_provider(None)
+
+    def test_a_word_derived_save_keeps_the_shortened_pauses(self, client, spoken_job):
+        cleaned = client.post(f"/jobs/{spoken_job}/edit/cleanup", json={}).json()
+        pauses_before = cleaned["summary"]["silence"]["count"]
+        removed_before = cleaned["removed_duration"]
+        assert pauses_before >= 1 and removed_before > 5
+
+        # Exactly what the editor sends: only ranges that strike words out.
+        word_derived = [
+            {"start": d["start"], "end": d["end"], "reason": "manual"}
+            for d in cleaned["prepared"] if d["reason"] != "silence"
+        ]
+        after = client.post(f"/jobs/{spoken_job}/edit",
+                            json={"deletions": word_derived}).json()
+
+        assert after["summary"]["silence"]["count"] == pauses_before, (
+            "the pause trims must survive a save that cannot describe them"
+        )
+        assert after["removed_duration"] == pytest.approx(removed_before, abs=0.5)
+
+    def test_the_exported_video_matches_what_the_page_showed(self, client, spoken_job):
+        """The bug's real symptom: the figures and the file disagreed."""
+        cleaned = client.post(f"/jobs/{spoken_job}/edit/cleanup", json={}).json()
+        word_derived = [
+            {"start": d["start"], "end": d["end"], "reason": "manual"}
+            for d in cleaned["prepared"] if d["reason"] != "silence"
+        ]
+        shown = client.post(f"/jobs/{spoken_job}/edit",
+                            json={"deletions": word_derived}).json()["kept_duration"]
+
+        client.post(f"/jobs/{spoken_job}/edit/export")
+        run_worker_once()
+        edit = jobs.get_edit(spoken_job)
+        assert edit["status"] == "complete", edit["error"]
+        assert edit["rendered_duration"] == pytest.approx(shown, abs=0.1), (
+            "the exported file must be the length the page promised"
+        )
+
+    def test_pauses_can_still_be_cleared_by_rerunning_cleanup(self, client, spoken_job):
+        client.post(f"/jobs/{spoken_job}/edit/cleanup", json={}).json()
+        without = client.post(
+            f"/jobs/{spoken_job}/edit/cleanup",
+            json={"remove_fillers": True, "shorten_silences": False},
+        ).json()
+        assert "silence" not in without["summary"]

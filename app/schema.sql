@@ -97,3 +97,23 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS suggestion_error TEXT;
 -- source deleted.
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS resume_status TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS finalised_at TIMESTAMPTZ;
+
+-- Text-based editing. One edit per job: the operator strikes words out of the
+-- transcript and the deletions are stored here. Keep-ranges are derived from
+-- (source duration, deletions) at render time rather than stored, so the
+-- document stays correct if the transcript is ever regenerated.
+CREATE TABLE IF NOT EXISTS edits (
+    id                BIGSERIAL PRIMARY KEY,
+    job_id            UUID NOT NULL UNIQUE REFERENCES jobs (id) ON DELETE CASCADE,
+    deletions         JSONB NOT NULL DEFAULT '[]',
+    status            TEXT NOT NULL DEFAULT 'draft',
+    output_filename   TEXT,
+    output_path       TEXT,
+    output_bytes      BIGINT,
+    expected_duration DOUBLE PRECISION,
+    rendered_duration DOUBLE PRECISION,
+    segment_count     INTEGER,
+    error             TEXT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);

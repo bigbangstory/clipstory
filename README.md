@@ -9,7 +9,12 @@ Hosted and invite-only. Nothing to install on anyone's machine. Everything,
 including the transcription and the AI, runs on your own server at no
 per-video cost.
 
-## What happens to a video
+## Two things it does
+
+One upload, one transcription, two ways to use it.
+
+**Clips.** The AI picks the moments worth cutting and they are already
+rendered when you open the page.
 
 ```
 UPLOAD -> TRANSCRIBE -> AI PICKS CLIPS -> CUT ALL PICKS -> REVIEW & TWEAK -> RE-CUT CHANGED -> DOWNLOAD
@@ -17,8 +22,16 @@ UPLOAD -> TRANSCRIBE -> AI PICKS CLIPS -> CUT ALL PICKS -> REVIEW & TWEAK -> RE-
           on the VM     on the VM         frame            drag, add, delete  you touched       + zip
 ```
 
-Nothing waits on a human. You open the page to a set of finished, playable
-clips. You only touch the ones you want to change.
+**Edit.** The transcript is a document. Strike words out and they are cut from
+the video.
+
+```
+UPLOAD -> TRANSCRIBE -> STRIKE WORDS OUT -> PREVIEW INSTANTLY -> EXPORT -> DOWNLOAD
+          Whisper       or one-click        the player skips     re-encodes   the whole
+          on the VM     cleanup             the deleted parts    in the bg    video, edited
+```
+
+Nothing waits on a human in either mode.
 
 ## The two guarantees
 
@@ -40,6 +53,27 @@ Whisper's measured word timings. A number that does not exist fails a lookup
 and is dropped. A model's worst case is a dull pick, never a wrong cut.
 
 Both are enforced by tests that fail if anyone regresses them.
+
+## Editing by text
+
+The transcript renders as a document beside the player. Drag across words,
+press Delete, and they are cut. Click a struck word to bring it back.
+
+**One-click cleanup** removes filler words (um, uh, erm, hmm, ah) and shortens
+long pauses. Conversational words (so, like, right, you know) are off by
+default, because each is usually doing real work in a sentence and removing
+them silently changes what someone said. Pauses are *shortened*, not removed:
+speech with its pauses stripped out sounds rushed.
+
+**Two things make this work on hardware that could never render it live:**
+
+Editing costs nothing. The preview player seeks past the deleted ranges, so
+the edit plays back immediately without encoding a thing. Only Export
+re-encodes, and that runs in the background like every other job.
+
+Cuts are snapped into silence. Every deletion is widened to the middle of the
+gap between the surrounding words, so the join lands where nobody is speaking
+instead of clipping the attack of a word.
 
 ## Reviewing the picks
 
@@ -80,6 +114,7 @@ manifest.json
 | Reading and cutting | ffprobe, ffmpeg (libx264, CRF 18) |
 | Transcription | faster-whisper, Whisper `base`, word timestamps, VAD |
 | Clip picking | Ollama running `qwen2.5:7b-instruct`, JSON-schema constrained |
+| Text editing | ffmpeg `trim`/`concat` via `-filter_complex_script`, frame-aligned |
 | Public URL | Cloudflare Tunnel, no inbound ports |
 
 Both model providers sit behind an interface: `TRANSCRIPTION_PROVIDER` and
@@ -104,7 +139,7 @@ docker compose up -d db
 DATABASE_URL=postgresql://clipstory:$PASSWORD@localhost:5432/clipstory ./run-tests.sh
 ```
 
-169 tests. The runner disables both model providers so nothing downloads
+285 tests. The runner disables both model providers so nothing downloads
 weights or calls a model; tests that need a transcript or suggestions inject
 fakes. Media and integration tests need `ffmpeg` and skip cleanly without it;
 integration tests need `TEST_DATABASE_URL`.

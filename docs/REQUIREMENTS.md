@@ -1,7 +1,7 @@
-# Clipstory - Requirements (v3)
+# Clipstory - Requirements (v4)
 
-Status: agreed. Supersedes v1 and v2; change log at the bottom.
-Last updated: 2026-09-11
+Status: agreed. Supersedes v1 to v3; change log at the bottom.
+Last updated: 2026-09-14
 
 ## 1. The brief
 
@@ -26,6 +26,51 @@ Three verbs: transcribe, crop, name. Everything below serves those.
 8. **Download** clips individually or as a zip with `manifest.json`.
 
 "Precut" is the default. A human is never required, only allowed.
+
+## 2a. The second mode: editing by text
+
+The same upload and the same transcript, used differently. The transcript is a
+document; striking words out cuts them from the video.
+
+1. **Strike words out** by dragging and pressing Delete, or **one-click
+   cleanup**: filler words removed, long pauses shortened.
+2. **Preview instantly.** The player seeks past deleted ranges. Nothing is
+   encoded while editing, which is what makes this affordable on 2 ARM cores.
+3. **Export** re-encodes the whole video in the background.
+
+Deletions are stored; keep-ranges are derived from them and the source
+duration, so the browser preview and the render cannot disagree.
+
+Two rules make the output correct:
+
+- **Cuts are snapped into silence.** Every deletion is widened to the middle of
+  the gap between the surrounding words, so a join lands where nobody is
+  speaking rather than clipping a word's attack.
+- **Ranges are frame-aligned before rendering,** and boundaries are placed
+  half a frame off so the selection comparison is unambiguous. Measured: the
+  output frame count is then exactly the sum of the aligned ranges, from 2 up
+  to 281 segments.
+- **`select`, never `trim`+`concat`.** trim+concat holds the whole span from
+  the first kept range to the last in memory, so its cost is set by the length
+  of the source rather than the number of cuts. Measured on a 60-second 1080p
+  source with 20 segments: **4.40 GB** peak for trim+concat against **0.38 GB**
+  for select, and select ran 2.6x faster. An hour of 1080p through trim+concat
+  would need hundreds of gigabytes and be killed on a 12 GB box.
+- **`gte(t,S)*lt(t,E)`, never `between()`.** `between` is inclusive at both
+  ends and keeps one extra frame per segment. Measured: 200 segments produced
+  2600 frames for a 2400-frame request, and 6.4 seconds of silent A/V desync.
+- **Audio is repacketised to one video frame per chunk before selection.**
+  Audio is selected in whole packets (~21ms) and video in whole frames, so
+  without this the two drift apart as a random walk. Measured over 281 cuts:
+  54ms out of sync without it, 0ms with it.
+- **Verification asserts the exact frame count,** not an approximate duration,
+  and separately checks audio against video. A tolerance that grows with the
+  number of cuts would hide exactly the bugs above.
+
+Filler defaults are `um, uh, erm, uhm, mm, hmm, ah, er, eh`. Conversational
+words (`so, like, right, you know, I mean`) are opt-in only: each is usually
+load-bearing, and removing them by default would change what someone said.
+Pauses over 0.8s are shortened to 0.4s, never removed outright.
 
 ## 3. Constraints
 
@@ -96,6 +141,10 @@ parallelism, editing beyond trimming. Revisit only with measured numbers.
 
 ## Change log
 
+- v4: added text-based editing as a second mode on the same upload, with
+  one-click cleanup. Frame alignment and snap-to-silence established by
+  measurement. Voice cloning, audio enhancement, captions and multitrack
+  remain out of scope.
 - v3: transcription and AI clip picking moved from "later" to the core, per
   the original brief. Local LLM replaces the hosted API. Precut default.
   Review-and-tweak layer added. Source retained until Finalise.

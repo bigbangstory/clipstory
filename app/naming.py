@@ -52,5 +52,10 @@ def clip_filename(
     return "_".join(parts) + ".mp4"
 
 
+def edit_filename(source_filename: str) -> str:
+    """The full-length edited video, distinct from the numbered clips."""
+    return f"{source_slug(source_filename)}_edited.mp4"
+
+
 def zip_filename(source_filename: str) -> str:
     return f"{source_slug(source_filename)}_clips.zip"

@@ -14,12 +14,18 @@
       <span>Size <b>{{ job.source_bytes | human_bytes }}</b></span>
     </div>
   </div>
-  {% if clips and (job.status in ('complete','finalised','failed')) %}
-  <div class="row">
-    <a class="btn" href="/jobs/{{ job.id }}/download.zip">Download all as zip</a>
-    <a class="btn secondary" href="/jobs/{{ job.id }}/manifest.json">manifest.json</a>
+  <div class="row" style="gap:14px">
+    {% if clips and (job.status in ('complete','finalised','failed')) %}
+      <a class="btn" href="/jobs/{{ job.id }}/download.zip">Download all as zip</a>
+      <a class="btn secondary" href="/jobs/{{ job.id }}/manifest.json">manifest.json</a>
+    {% endif %}
+    {% if transcript %}
+      <div class="modes">
+        <a href="/jobs/{{ job.id }}" class="on">Clips</a>
+        <a href="/jobs/{{ job.id }}/edit">Edit</a>
+      </div>
+    {% endif %}
   </div>
-  {% endif %}
 </div>
 
 {% if job.variable_frame_rate %}
