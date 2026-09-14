@@ -73,6 +73,26 @@ docker compose logs -f web      # wait for "clipstory web ready"
 curl localhost:8000/healthz     # {"status":"ok"}
 ```
 
+### A note on ARM64, checked before you build
+
+Every compiled dependency this image needs publishes a prebuilt `aarch64`
+wheel, so nothing compiles from source on the VM. Verified against PyPI on
+14 Sep 2026, against the `python:3.11-slim` base this image uses:
+
+| Package | aarch64 wheel for cp311 |
+|---|---|
+| `ctranslate2` (the Whisper engine) | yes, `manylinux_2_28_aarch64` |
+| `onnxruntime` | yes |
+| `psycopg-binary` | yes |
+| `pydantic-core`, `numpy`, `tokenizers` | yes |
+| `uvloop`, `httptools` | yes |
+| `faster-whisper`, `huggingface-hub` | pure Python |
+
+This matters because CTranslate2 compiling from source on two ARM cores would
+take hours and then probably run out of memory. If you ever bump the base image
+past Python 3.11, check that `ctranslate2` still ships a wheel for the new
+version first: it is the one dependency with no viable fallback.
+
 ## Step 5: Put it on the internet with Cloudflare Tunnel
 
 You need a domain on Cloudflare (free plan is fine).
